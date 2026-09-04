@@ -1,9 +1,9 @@
 const { register, login, showMe } = require("../services/authService");
 
 const registerController = async (req, res) => {
-    const { name, email, password, role } = req.body;
+    const { name, email, password, address, role } = req.body;
 
-    const token = await register(name, email, password, role);
+    const token = await register(name, email, password, address, role);
     res.status(201).json({ token });
 
 }

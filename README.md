@@ -16,3 +16,6 @@
     *POST /api/v1/orders
     *GET  /api/v1/orders
     *GET  /api/v1/orders/:id
+    *PATCH /api/v1/orders/:id/status
+    *PATCH /api/v1/orders/:id/quantity
+    *DELETE  /api/v1/orders/:id

@@ -3,9 +3,9 @@ const BadRequestError = require("../error_handlers/BadRequestError");
 const UnAuthenticatedError = require("../error_handlers/UnAuthenticatedError");
 const jwt = require("jsonwebtoken");
 
-async function register(name, email, password, role) {
+async function register(name, email, password, address, role) {
 
-    if (!name || !email || !password) {
+    if (!name || !email || !password || !address) {
         throw new BadRequestError("Please provide all the details");
     }
 
@@ -14,7 +14,7 @@ async function register(name, email, password, role) {
         throw new BadRequestError("User already exists");
     }
 
-    const user = await User.create({ name, email, password, role });
+    const user = await User.create({ name, email, password, address, role });
 
     const token = jwt.sign({ userId: user._id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '3d' });
 

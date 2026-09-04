@@ -13,7 +13,8 @@ const OrderSchema = new mongoose.Schema({
     },
     quantity: {
         type: Number,
-        required: [true, "quantity is required"]
+        required: [true, "quantity is required"],
+        min: [1, "quantity must be at least 1"]
     },
     price: {
         type: Number,
@@ -21,8 +22,7 @@ const OrderSchema = new mongoose.Schema({
     },
     orderStatus: {
         type: String,
-        enum: ["pending", "failed", "success", "delivered"],
-        default: "pending",
+        enum: ["pending", "failed", "packed", "in transit", "delivered"],
         required: [true, "orderStatus is required"]
     }
 }, {
