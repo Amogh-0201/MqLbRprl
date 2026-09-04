@@ -125,6 +125,23 @@ JWT_SECRET=your_super_secret_jwt_key_here
   npm start
   ```
 
+### Running Tests
+The project uses Jest with Supertest for in-process HTTP requests against the exported Express app. The route tests are integration tests: they exercise the middleware, controllers, services, and MongoDB together. MongoDB is provided by `mongodb-memory-server`, so the tests never connect to your Atlas cluster or modify its data.
+
+To execute all route and application tests across Auth, Products, and Orders:
+```bash
+npm test
+```
+The test command runs files sequentially to keep the in-memory database lifecycle predictable.
+To run a specific test suite file:
+```bash
+npx jest tests/auth.test.js --runInBand
+npx jest tests/products.test.js --runInBand
+npx jest tests/orders.test.js --runInBand
+```
+
+Each suite starts a temporary MongoDB process, connects Mongoose to it, and stops it during teardown. No test database name or test MongoDB Atlas credentials are required. The first run may download the MongoDB binary used by `mongodb-memory-server`.
+
 ---
 
 ## Authentication & Authorization
