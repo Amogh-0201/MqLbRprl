@@ -1,3 +1,5 @@
+const CustomApiError = require("./CustomApiError");
+
 class UnAuthenticatedError extends CustomApiError {
     constructor(message) {
         super(message, 401);

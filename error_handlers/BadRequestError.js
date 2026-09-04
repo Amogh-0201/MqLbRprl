@@ -1,3 +1,5 @@
+const CustomApiError = require("./CustomApiError");
+
 class BadRequestError extends CustomApiError {
     constructor(message) {
         super(message, 400);
