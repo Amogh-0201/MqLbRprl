@@ -8,6 +8,7 @@ const connectDb = require("./db/connectDb");
 
 //routes
 const authRouter = require("./routes/authRoute");
+const productRouter = require("./routes/productRoute");
 
 const app = express();
 
@@ -15,6 +16,7 @@ const port = process.env.PORT || 3000;
 
 app.use(express.json());
 app.use("/api/v1/auth", authRouter);
+app.use("/api/v1/products", productRouter);
 
 app.use(notFound);
 app.use(errorHandlerMiddleware);

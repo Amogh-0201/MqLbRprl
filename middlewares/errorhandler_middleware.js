@@ -10,9 +10,14 @@ const errorHandlerMiddleware = (error, req, res, next) => {
             .join(", ");
         return res.status(400).json({ error: message });
     }
+    else if (error.name === "CastError" && error.kind === "ObjectId") {
+        return res.status(400).json({
+            error: `Invalid ID format: ${error.value}. Must be a 24-character hex string.`
+        });
+    }
 
     console.log(error);
-    return res.status(500).json({ msg: error });
+    return res.status(500).json({ error: "Something went wrong" });
 }
 
 module.exports = errorHandlerMiddleware;

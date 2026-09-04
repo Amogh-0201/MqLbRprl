@@ -1,10 +1,10 @@
 const mongoose = require("mongoose");
 
 const ProductScema = new mongoose.Schema({
-    producerId: {
+    adminId: {
         type: mongoose.Schema.Types.ObjectId,
         ref: "User",
-        required: [true, "producerId is required"]
+        required: [true, "adminId is required"]
     },
     name: {
         type: String,
