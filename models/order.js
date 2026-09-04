@@ -14,6 +14,10 @@ const OrderSchema = new mongoose.Schema({
     quantity: {
         type: Number,
         required: [true, "quantity is required"],
+        validate: {
+            validator: Number.isInteger,
+            message: "{VALUE} is not an integer value"
+        },
         min: [1, "quantity must be at least 1"]
     },
     price: {

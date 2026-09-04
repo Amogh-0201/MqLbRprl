@@ -1,29 +1,32 @@
 const Product = require("../models/product");
 const User = require("../models/user");
+const Order = require("../models/order");
 const BadRequestError = require("../error_handlers/BadRequestError");
 const UnAuthenticatedError = require("../error_handlers/UnAuthenticatedError");
+const ForbiddenError = require("../error_handlers/ForbiddenError");
+const NotFoundError = require("../error_handlers/NotFoundError");
 
 async function createProduct(userId, name, price, quantity, image, description) {
 
-    if (!userId || !name || !price || !quantity) {
-        throw new BadRequestError("Please Provide all required fields");
+    if (!userId || !name || price == null || quantity == null) {
+        throw new BadRequestError("Please provide all required fields");
     }
 
-    if (price <= 0) {
+    if (typeof price !== "number" || price <= 0) {
         throw new BadRequestError("Price must be greater than 0");
     }
 
-    if (quantity < 0) {
-        throw new BadRequestError("Quantity can't be negative");
+    if (!Number.isInteger(quantity) || quantity < 0) {
+        throw new BadRequestError("Quantity must be a non-negative integer");
     }
 
-    const user = await User.findOne({ _id: userId });
+    const user = await User.findById(userId);
     if (!user) {
-        throw new UnAuthenticatedError("User does not exist")
+        throw new UnAuthenticatedError("User does not exist");
     }
 
     if (user.role !== "admin") {
-        throw new UnAuthenticatedError("Only admin can create products")
+        throw new ForbiddenError("Only admin can create products");
     }
 
     const product = await Product.create({
@@ -50,7 +53,7 @@ async function getProduct(productId) {
 
     const product = await Product.findById(productId);
     if (!product) {
-        throw new BadRequestError("Product with the given product id does not exist");
+        throw new NotFoundError("Product with the given product id does not exist");
     }
     return product;
 }
@@ -58,24 +61,24 @@ async function getProduct(productId) {
 
 async function updateProduct(productId, userId, updateData) {
 
-    const product = await Product.findOne({ _id: productId });
+    const product = await Product.findById(productId);
     if (!product) {
-        throw new BadRequestError("Product with the given product id does not exist");
+        throw new NotFoundError("Product with the given product id does not exist");
     }
 
     if (userId !== product.adminId.toString()) {
-        throw new UnAuthenticatedError("Only the admin who created the product can update it");
+        throw new ForbiddenError("Only the admin who created the product can update it");
     }
 
     if (updateData.price !== undefined) {
-        if (updateData.price <= 0) {
+        if (typeof updateData.price !== "number" || updateData.price <= 0) {
             throw new BadRequestError("Price must be greater than 0");
         }
     }
 
     if (updateData.quantity !== undefined) {
-        if (updateData.quantity < 0) {
-            throw new BadRequestError("Quantity can't be negative");
+        if (!Number.isInteger(updateData.quantity) || updateData.quantity < 0) {
+            throw new BadRequestError("Quantity must be a non-negative integer");
         }
     }
 
@@ -98,13 +101,21 @@ async function updateProduct(productId, userId, updateData) {
 
 async function deleteProduct(userId, productId) {
 
-    const product = await Product.findOne({ _id: productId });
+    const product = await Product.findById(productId);
     if (!product) {
-        throw new BadRequestError("Product with the given product id does not exist");
+        throw new NotFoundError("Product with the given product id does not exist");
     }
 
     if (userId !== product.adminId.toString()) {
-        throw new UnAuthenticatedError("Only the admin who created the product can delete it");
+        throw new ForbiddenError("Only the admin who created the product can delete it");
+    }
+
+    const activeOrder = await Order.findOne({
+        product: productId,
+        orderStatus: { $in: ["pending", "packed", "in transit"] }
+    });
+    if (activeOrder) {
+        throw new BadRequestError("Cannot delete product with active orders in progress");
     }
 
     const deletedProduct = await Product.findByIdAndDelete(productId);

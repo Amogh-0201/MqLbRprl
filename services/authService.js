@@ -1,6 +1,7 @@
 const User = require("../models/user");
 const BadRequestError = require("../error_handlers/BadRequestError");
 const UnAuthenticatedError = require("../error_handlers/UnAuthenticatedError");
+const NotFoundError = require("../error_handlers/NotFoundError");
 const jwt = require("jsonwebtoken");
 
 async function register(name, email, password, address, role) {
@@ -47,10 +48,10 @@ async function showMe(userId) {
         throw new BadRequestError("No UserId Found");
     }
 
-    const user = await User.findOne({ _id: userId });
+    const user = await User.findById(userId).select("-password");
 
     if (!user) {
-        throw new UnAuthenticatedError("Invalid userId");
+        throw new NotFoundError("User not found");
     }
 
     return user;

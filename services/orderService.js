@@ -3,32 +3,34 @@ const User = require("../models/user");
 const Product = require("../models/product");
 const BadRequestError = require("../error_handlers/BadRequestError");
 const UnAuthenticatedError = require("../error_handlers/UnAuthenticatedError");
+const ForbiddenError = require("../error_handlers/ForbiddenError");
+const NotFoundError = require("../error_handlers/NotFoundError");
 
 async function placeOrder(userId, productId, quantity) {
 
     if (!userId || !productId || quantity == null) {
-        throw new BadRequestError("Please provide the required fields")
+        throw new BadRequestError("Please provide all required fields");
+    }
+
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+        throw new BadRequestError("Quantity must be a positive integer");
     }
 
     const user = await User.findById(userId);
     if (!user) {
-        throw new BadRequestError("User not found");
+        throw new NotFoundError("User not found");
     }
     if (user.role !== "user") {
-        throw new UnAuthenticatedError("seller / admin can not order products");
+        throw new ForbiddenError("Seller / admin cannot order products");
     }
 
     const product = await Product.findById(productId);
     if (!product) {
-        throw new BadRequestError("Product not found");
-    }
-
-    if (quantity <= 0) {
-        throw new BadRequestError("Quantity must be greater than 0");
+        throw new NotFoundError("Product not found");
     }
 
     if (quantity > product.quantity) {
-        throw new BadRequestError(`Insufficent Stock: Available - ${product.quantity} Required - ${quantity}`);
+        throw new BadRequestError(`Insufficient stock: Available - ${product.quantity}, Required - ${quantity}`);
     }
 
     const orderPrice = quantity * product.price;
@@ -47,19 +49,19 @@ async function placeOrder(userId, productId, quantity) {
         { returnDocument: 'after', runValidators: true }
     );
 
-    return order;
+    return await order.populate("product", "name price image description");
 }
 
 
 async function getOrders(userId) {
 
     if (!userId) {
-        throw new BadRequestError("User not found");
+        throw new BadRequestError("User ID is required");
     }
 
     const user = await User.findById(userId);
     if (!user) {
-        throw new BadRequestError("User not found");
+        throw new NotFoundError("User not found");
     }
 
     if (user.role === "user") {
@@ -67,20 +69,29 @@ async function getOrders(userId) {
             .populate("product", "name price image description")
             .sort({ createdAt: -1 });
         return orders;
+    } else if (user.role === "admin") {
+        // Admin gets orders placed for products they manage
+        const adminProducts = await Product.find({ adminId: userId }).select("_id");
+        const productIds = adminProducts.map((p) => p._id);
+        const orders = await Order.find({ product: { $in: productIds } })
+            .populate("product", "name price image description")
+            .populate("user", "name email address")
+            .sort({ createdAt: -1 });
+        return orders;
     } else {
-        throw new UnAuthenticatedError("No orders for Admin / Seller");
+        throw new ForbiddenError("Unauthorized role for fetching orders");
     }
 }
 
 async function getOrderById(userId, orderId) {
 
     if (!userId || !orderId) {
-        throw new BadRequestError("Please provide the required fields")
+        throw new BadRequestError("Please provide all required fields");
     }
 
     const user = await User.findById(userId);
     if (!user) {
-        throw new BadRequestError("User not found");
+        throw new NotFoundError("User not found");
     }
 
     if (user.role === "user") {
@@ -88,14 +99,27 @@ async function getOrderById(userId, orderId) {
             .populate("product", "name price image description");
 
         if (!order) {
-            throw new BadRequestError("Order not found");
+            throw new NotFoundError("Order not found");
+        }
+
+        return order;
+    } else if (user.role === "admin") {
+        const order = await Order.findById(orderId)
+            .populate("product", "name price image description adminId")
+            .populate("user", "name email address");
+
+        if (!order) {
+            throw new NotFoundError("Order not found");
+        }
+
+        if (!order.product || order.product.adminId.toString() !== userId) {
+            throw new ForbiddenError("Not authorized to view this order");
         }
 
         return order;
     } else {
-        throw new UnAuthenticatedError("No orders for Admin / Seller");
+        throw new ForbiddenError("Unauthorized role for fetching order");
     }
-
 }
 
 
@@ -105,27 +129,32 @@ async function updateOrderStatus(userId, orderId, orderStatus) {
         throw new BadRequestError("Please provide all required fields");
     }
 
+    const validStatuses = ["pending", "failed", "packed", "in transit", "delivered"];
+    if (!validStatuses.includes(orderStatus)) {
+        throw new BadRequestError(`Invalid order status. Allowed values: ${validStatuses.join(", ")}`);
+    }
+
     const user = await User.findById(userId);
     if (!user) {
-        throw new BadRequestError("User not found");
+        throw new NotFoundError("User not found");
     }
 
     if (user.role !== "admin") {
-        throw new UnAuthenticatedError("Only Admin can update order status");
+        throw new ForbiddenError("Only Admin can update order status");
     }
 
     const order = await Order.findById(orderId);
     if (!order) {
-        throw new BadRequestError("Order not found");
+        throw new NotFoundError("Order not found");
     }
 
     const product = await Product.findById(order.product);
     if (!product) {
-        throw new BadRequestError("ordered product not found");
+        throw new NotFoundError("Ordered product not found");
     }
 
     if (product.adminId.toString() !== userId) {
-        throw new UnAuthenticatedError("only admin who owns the product can update the order status");
+        throw new ForbiddenError("Only the admin who owns the product can update the order status");
     }
 
     if (order.orderStatus === "delivered" || order.orderStatus === "failed") {
@@ -143,14 +172,14 @@ async function updateOrderStatus(userId, orderId, orderStatus) {
             { $inc: { quantity: order.quantity } },
             { returnDocument: 'after', runValidators: true }
         );
-        return updatedOrder;
+        return await updatedOrder.populate("product", "name price image description");
     } else {
         const updatedOrder = await Order.findOneAndUpdate(
             { _id: orderId },
             { $set: { orderStatus: orderStatus } },
             { returnDocument: 'after', runValidators: true }
         );
-        return updatedOrder.populate("product", "name price image description");
+        return await updatedOrder.populate("product", "name price image description");
     }
 }
 
@@ -161,26 +190,26 @@ async function updateOrderQuantity(userId, orderId, quantity) {
         throw new BadRequestError("Please provide all required fields");
     }
 
-    const user = await User.findById(userId);
-    if (!user) {
-        throw new BadRequestError("User not found");
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+        throw new BadRequestError("Quantity must be a positive integer");
     }
 
-    if (quantity <= 0) {
-        throw new BadRequestError("Quantity must be greater than 0");
+    const user = await User.findById(userId);
+    if (!user) {
+        throw new NotFoundError("User not found");
     }
 
     if (user.role !== "user") {
-        throw new UnAuthenticatedError("only user can update order quantity");
+        throw new ForbiddenError("Only user can update order quantity");
     }
 
     const order = await Order.findById(orderId);
     if (!order) {
-        throw new BadRequestError("Order not found");
+        throw new NotFoundError("Order not found");
     }
 
     if (order.user.toString() !== userId) {
-        throw new UnAuthenticatedError("only user who owns the order can update the order quantity");
+        throw new ForbiddenError("Only the user who owns the order can update the order quantity");
     }
 
     if (order.orderStatus !== "pending") {
@@ -189,11 +218,11 @@ async function updateOrderQuantity(userId, orderId, quantity) {
 
     const product = await Product.findById(order.product);
     if (!product) {
-        throw new BadRequestError("ordered product not found");
+        throw new NotFoundError("Ordered product not found");
     }
 
     if (quantity > (product.quantity + order.quantity)) {
-        throw new BadRequestError(`Insufficent Stock: Available - ${product.quantity + order.quantity} Required - ${quantity}`);
+        throw new BadRequestError(`Insufficient stock: Available - ${product.quantity + order.quantity}, Required - ${quantity}`);
     }
 
     const updatedOrder = await Order.findOneAndUpdate(
@@ -208,7 +237,7 @@ async function updateOrderQuantity(userId, orderId, quantity) {
         { returnDocument: 'after', runValidators: true }
     );
 
-    return updatedOrder.populate("product", "name price image description");
+    return await updatedOrder.populate("product", "name price image description");
 }
 
 
@@ -220,32 +249,29 @@ async function deleteOrder(userId, orderId) {
 
     const user = await User.findById(userId);
     if (!user) {
-        throw new BadRequestError("User not found");
+        throw new NotFoundError("User not found");
     }
 
     if (user.role !== "user") {
-        throw new UnAuthenticatedError("only user can delete order");
+        throw new ForbiddenError("Only user can delete order");
     }
 
     const order = await Order.findById(orderId);
     if (!order) {
-        throw new BadRequestError("Order not found");
+        throw new NotFoundError("Order not found");
     }
 
     if (order.user.toString() !== userId) {
-        throw new UnAuthenticatedError("only user who owns the order can delete the order");
+        throw new ForbiddenError("Only the user who owns the order can delete the order");
     }
 
     if (order.orderStatus !== "pending") {
         throw new BadRequestError(`Order cannot be deleted as it is already ${order.orderStatus}`);
     }
 
-    const product = await Product.findById(order.product);
-    if (!product) {
-        throw new BadRequestError("ordered product not found");
-    }
-
     await Order.findByIdAndDelete(orderId);
+
+    // Restore product stock if product still exists
     await Product.findOneAndUpdate(
         { _id: order.product },
         { $inc: { quantity: order.quantity } },

@@ -1,6 +1,6 @@
 const mongoose = require("mongoose");
 
-const ProductScema = new mongoose.Schema({
+const ProductSchema = new mongoose.Schema({
     adminId: {
         type: mongoose.Schema.Types.ObjectId,
         ref: "User",
@@ -35,4 +35,4 @@ const ProductScema = new mongoose.Schema({
     timestamps: true
 });
 
-module.exports = mongoose.model("Product", ProductScema);
+module.exports = mongoose.model("Product", ProductSchema);

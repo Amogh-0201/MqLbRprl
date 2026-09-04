@@ -62,7 +62,7 @@ async function deleteProductController(req, res) {
     const { userId } = req.user;
 
     await deleteProduct(userId, productId);
-    res.status(204).json({ msg: "Product deleted successfully" });
+    res.status(200).json({ msg: "Product deleted successfully" });
 }
 
 

@@ -54,7 +54,7 @@ const deleteOrderController = async (req, res) => {
     const { userId } = req.user;
     const { orderId } = req.params;
     await deleteOrder(userId, orderId);
-    res.status(204).json({ msg: "Order deleted successfully" });
+    res.status(200).json({ msg: "Order deleted successfully" });
 }
 
 

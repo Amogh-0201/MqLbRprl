@@ -15,6 +15,12 @@ const errorHandlerMiddleware = (error, req, res, next) => {
             error: `Invalid ID format: ${error.value}. Must be a 24-character hex string.`
         });
     }
+    else if (error.code && error.code === 11000) {
+        const field = Object.keys(error.keyValue).join(", ");
+        return res.status(400).json({
+            error: `Duplicate value entered for '${field}'. Please choose another value.`
+        });
+    }
 
     console.log(error);
     return res.status(500).json({ error: "Something went wrong" });
