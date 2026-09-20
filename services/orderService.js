@@ -1,6 +1,7 @@
 const Order = require("../models/order");
 const User = require("../models/user");
 const Product = require("../models/product");
+const mongoose = require("mongoose");
 const BadRequestError = require("../error_handlers/BadRequestError");
 const UnAuthenticatedError = require("../error_handlers/UnAuthenticatedError");
 const ForbiddenError = require("../error_handlers/ForbiddenError");
@@ -24,34 +25,65 @@ async function placeOrder(userId, productId, quantity) {
         throw new ForbiddenError("Seller / admin cannot order products");
     }
 
-    const product = await Product.findById(productId);
-    if (!product) {
-        throw new NotFoundError("Product not found");
+    const session = await mongoose.startSession();
+
+    let order;
+
+    try {
+        await session.withTransaction(async () => {
+
+            const product = await Product.findById(productId).session(session);
+
+            if (!product) {
+                throw new NotFoundError("Product not found");
+            }
+
+            const orderPrice = quantity * product.price;
+
+            /*
+                mongodb will update only if enough stocks is available at that moment
+            */
+
+            const updatedProduct = await Product.findOneAndUpdate(
+                {
+                    _id: productId,
+                    quantity: { $gte: quantity }
+                },
+                {
+                    $inc: { quantity: -quantity }
+                },
+                {
+                    new: true,
+                    session
+                }
+            );
+
+            if (!updatedProduct) {
+                throw new BadRequestError("Insufficient Stock");
+            }
+
+            order = new Order({
+                user: userId,
+                product: productId,
+                quantity: quantity,
+                price: orderPrice,
+                orderStatus: "pending"
+            });
+
+            await order.save({ session });
+        });
+
+        return await order.populate(
+            "product",
+            "name price image description"
+        );
+
+    } catch (error) {
+        throw error;
+    } finally {
+        session.endSession();
     }
-
-    if (quantity > product.quantity) {
-        throw new BadRequestError(`Insufficient stock: Available - ${product.quantity}, Required - ${quantity}`);
-    }
-
-    const orderPrice = quantity * product.price;
-
-    const order = await Order.create({
-        user: userId,
-        product: productId,
-        quantity: quantity,
-        price: orderPrice,
-        orderStatus: "pending"
-    });
-
-    await Product.findOneAndUpdate(
-        { _id: productId },
-        { $inc: { quantity: -quantity } },
-        { returnDocument: 'after', runValidators: true }
-    );
-
-    return await order.populate("product", "name price image description");
 }
-
 
 async function getOrders(userId) {
 
