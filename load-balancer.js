@@ -1,3 +1,7 @@
+/*
+    JUST FOR LEARNING, NOW WE ARE NOT USING THIS BUT USING NGINX LOAD BALANCER LIKE INDUSTRY.
+*/
+
 require("dotenv").config();
 const http = require("node:http");
 

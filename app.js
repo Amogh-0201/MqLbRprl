@@ -49,7 +49,7 @@ app.use(errorHandlerMiddleware);
 // Server Startup
 async function start() {
     await connectDb();
-    app.listen(port, () => {
+    app.listen(port, "0.0.0.0", () => {
         console.log(`Server is running on port ${port}`);
     });
 }
