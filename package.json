@@ -6,7 +6,8 @@
   "scripts": {
     "test": "jest --runInBand",
     "dev": "nodemon app.js",
-    "start": "node app.js"
+    "start": "node app.js",
+    "lb": "node load-balancer.js"
   },
   "keywords": [],
   "author": "",
