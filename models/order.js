@@ -28,6 +28,11 @@ const OrderSchema = new mongoose.Schema({
         type: String,
         enum: ["pending", "failed", "packed", "in transit", "delivered"],
         required: [true, "orderStatus is required"]
+    },
+    idempotencyKey: {
+        type: String,
+        unique: true,
+        sparse: true
     }
 }, {
     timestamps: true

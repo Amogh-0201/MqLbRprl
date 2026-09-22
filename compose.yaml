@@ -100,6 +100,7 @@ services:
     environment:
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      MONGO_URI: ${MONGO_URI}
     depends_on:
       - redis
     restart: unless-stopped

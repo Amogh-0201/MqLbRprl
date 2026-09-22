@@ -1,6 +1,7 @@
 const express = require("express");
 const {
     placeOrderController,
+    getOrderJobStatusController,
     getOrdersController,
     getOrderByIdController,
     updateOrderStatusController,
@@ -14,6 +15,8 @@ const router = express.Router();
 router.route("/")
     .post(authenticateMiddleware, placeOrderController)
     .get(authenticateMiddleware, getOrdersController);
+
+router.get("/jobs/:jobId", authenticateMiddleware, getOrderJobStatusController);
 
 router.route("/:orderId")
     .get(authenticateMiddleware, getOrderByIdController)

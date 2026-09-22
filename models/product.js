@@ -25,6 +25,10 @@ const ProductSchema = new mongoose.Schema({
         },
         min: [0, "quantity cannot be negative"]
     },
+    flashSaleActive: {
+        type: Boolean,
+        default: false
+    },
     image: {
         type: String
     },

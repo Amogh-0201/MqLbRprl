@@ -7,7 +7,12 @@ const UnAuthenticatedError = require("../error_handlers/UnAuthenticatedError");
 const ForbiddenError = require("../error_handlers/ForbiddenError");
 const NotFoundError = require("../error_handlers/NotFoundError");
 
-async function placeOrder(userId, productId, quantity) {
+async function placeOrder(
+    userId,
+    productId,
+    quantity,
+    idempotencyKey = null
+) {
 
     if (!userId || !productId || quantity == null) {
         throw new BadRequestError("Please provide all required fields");
@@ -23,6 +28,20 @@ async function placeOrder(userId, productId, quantity) {
     }
     if (user.role !== "user") {
         throw new ForbiddenError("Seller / admin cannot order products");
+    }
+
+    if (idempotencyKey) {
+        const existingOrder = await Order.findOne({
+            user: userId,
+            idempotencyKey
+        }).populate(
+            "product",
+            "name price image description"
+        );
+
+        if (existingOrder) {
+            return existingOrder;
+        }
     }
 
     const session = await mongoose.startSession();
@@ -67,7 +86,8 @@ async function placeOrder(userId, productId, quantity) {
                 product: productId,
                 quantity: quantity,
                 price: orderPrice,
-                orderStatus: "pending"
+                orderStatus: "pending",
+                idempotencyKey: idempotencyKey || undefined
             });
 
             await order.save({ session });
@@ -193,6 +213,12 @@ async function updateOrderStatus(userId, orderId, orderStatus) {
         throw new BadRequestError("Order cannot be updated as it is already delivered or failed");
     }
 
+    if (product.flashSaleActive) {
+        throw new BadRequestError(
+            "Cannot modify a flash-sale order while the flash sale is active"
+        );
+    }
+
     if (orderStatus === "failed") {
         const updatedOrder = await Order.findOneAndUpdate(
             { _id: orderId },
@@ -253,6 +279,12 @@ async function updateOrderQuantity(userId, orderId, quantity) {
         throw new NotFoundError("Ordered product not found");
     }
 
+    if (product.flashSaleActive) {
+        throw new BadRequestError(
+            "Cannot modify a flash-sale order while the flash sale is active"
+        );
+    }
+
     if (quantity > (product.quantity + order.quantity)) {
         throw new BadRequestError(`Insufficient stock: Available - ${product.quantity + order.quantity}, Required - ${quantity}`);
     }
@@ -299,6 +331,17 @@ async function deleteOrder(userId, orderId) {
 
     if (order.orderStatus !== "pending") {
         throw new BadRequestError(`Order cannot be deleted as it is already ${order.orderStatus}`);
+    }
+
+    const product = await Product.findById(order.product);
+    if (!product) {
+        throw new NotFoundError("Ordered product not found");
+    }
+
+    if (product.flashSaleActive) {
+        throw new BadRequestError(
+            "Cannot delete a flash-sale order while the flash sale is active"
+        );
     }
 
     await Order.findByIdAndDelete(orderId);

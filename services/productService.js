@@ -82,6 +82,15 @@ async function updateProduct(productId, userId, updateData) {
         }
     }
 
+    if (
+        updateData.quantity !== undefined &&
+        product.flashSaleActive
+    ) {
+        throw new BadRequestError(
+            "Cannot change product stock while flash sale is active"
+        );
+    }
+
     const fieldsToUpdate = {};
     for (const key in updateData) {
         if (updateData[key] !== undefined) {
@@ -108,6 +117,12 @@ async function deleteProduct(userId, productId) {
 
     if (userId !== product.adminId.toString()) {
         throw new ForbiddenError("Only the admin who created the product can delete it");
+    }
+
+    if (product.flashSaleActive) {
+        throw new BadRequestError(
+            "Cannot delete product while flash sale is active"
+        );
     }
 
     const activeOrder = await Order.findOne({
