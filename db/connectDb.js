@@ -1,6 +1,5 @@
 const mongoose = require("mongoose");
 const CustomApiError = require("../error_handlers/CustomApiError");
-require("dotenv").config();
 
 async function connectDb() {
     try {

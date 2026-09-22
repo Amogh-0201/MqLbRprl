@@ -15,8 +15,10 @@
   "type": "commonjs",
   "dependencies": {
     "bcryptjs": "^3.0.3",
+    "bullmq": "^6.3.8",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "ioredis": "^6.0.0",
     "joi": "^18.2.8",
     "jsonwebtoken": "^9.0.3",
     "mongodb": "^7.6.0",
