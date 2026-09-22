@@ -194,8 +194,15 @@ const getOrderJobStatusController = async (req, res) => {
         return res.status(200).json({
             jobId,
             status: "COMPLETED",
-            orderId:
-                job.returnvalue?.orderId
+            orderId: job.returnvalue?.orderId,
+
+            createdAt: job.timestamp,
+            processedOn: job.processedOn,
+            finishedOn: job.finishedOn,
+
+            queueWaitMs: job.processedOn - job.timestamp,
+            processingMs: job.finishedOn - job.processedOn,
+            totalJobMs: job.finishedOn - job.timestamp
         });
     }
 

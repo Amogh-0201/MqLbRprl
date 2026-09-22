@@ -9,6 +9,9 @@ services:
       INSTANCE_ID: server-1
     expose:
       - 3000
+    depends_on:
+      mongo:
+        condition: service_healthy
     healthcheck:
       test: 
         [
@@ -31,6 +34,9 @@ services:
       INSTANCE_ID: server-2
     expose:
       - "3000"
+    depends_on:
+      mongo:
+        condition: service_healthy
     healthcheck:
       test:
         [
@@ -53,6 +59,9 @@ services:
       INSTANCE_ID: server-3
     expose:
       - "3000"
+    depends_on:
+      mongo:
+        condition: service_healthy
     healthcheck:
       test:
         [
@@ -93,6 +102,29 @@ services:
       timeout: 3s
       retries: 5
 
+  mongo:
+    image: mongodb/mongodb-community-server:8.0-ubi9-slim
+    container_name: mq-lb-rprl-mongo
+    command:
+      - mongod
+      - --replSet
+      - rs0
+      - --port
+      - "27017"
+    ports:
+      - "127.0.0.1:27018:27017"
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mongosh --quiet --eval \"db.adminCommand('ping').ok\""
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   order-worker:
     build: .
     container_name: mq-lb-rprl-order-worker
@@ -101,9 +133,14 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: 6379
       MONGO_URI: ${MONGO_URI}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-1}
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
   redis-data:
+  mongodb_data:

@@ -68,7 +68,7 @@ async function startWorker() {
 
             {
                 connection: redisConnection,
-                concurrency: 1
+                concurrency: Number(process.env.WORKER_CONCURRENCY || 1)
             }
         );
 
