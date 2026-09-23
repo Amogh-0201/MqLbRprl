@@ -470,6 +470,9 @@ The local benchmark environment keeps load-test writes away from Atlas.
 ```text
 MqLbRprl/
 │
+├── config/
+│   └── redis.js
+│
 ├── controllers/
 │   ├── authController.js
 │   ├── orderController.js
