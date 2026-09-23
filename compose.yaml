@@ -3,7 +3,7 @@ services:
   app1:
     build: .
     env_file:
-      - .env.local
+      - .env
     environment:
       PORT: 3000
       INSTANCE_ID: server-1
@@ -28,7 +28,7 @@ services:
   app2:
     build: .
     env_file:
-      - .env.local
+      - .env
     environment:
       PORT: 3000
       INSTANCE_ID: server-2
@@ -53,7 +53,7 @@ services:
   app3:
     build: .
     env_file:
-      - .env.local
+      - .env
     environment:
       PORT: 3000
       INSTANCE_ID: server-3
