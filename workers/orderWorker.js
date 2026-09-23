@@ -72,6 +72,8 @@ async function startWorker() {
             }
         );
 
+        console.log("[WORKER] worker concurrency - ", worker.concurrency);
+
         worker.on(
             "completed",
             (job, result) => {

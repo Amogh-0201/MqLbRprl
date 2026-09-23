@@ -318,7 +318,7 @@ async function main() {
     );
 
     console.log(
-        `$env:TEST_TOKEN="<USER_TOKEN>"`
+        `$env:TEST_TOKEN="${userToken}"`
     );
 
     console.log(

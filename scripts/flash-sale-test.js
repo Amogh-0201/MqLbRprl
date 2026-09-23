@@ -1,18 +1,15 @@
-const { Queue } = require("bullmq");
 const { performance } = require("perf_hooks");
 const crypto = require("crypto");
 
-const PRODUCT_ID = process.env.PRODUCT_ID;
+// ============================================================
+// BENCHMARK INPUTS
+// These are CLIENT/load parameters, not server configuration.
+// ============================================================
 
+const PRODUCT_ID = process.env.PRODUCT_ID;
 const TOKEN = process.env.TEST_TOKEN;
 
-const BASE_URL =
-    "http://localhost:8080";
-
-const REDIS_CONNECTION = {
-    host: "127.0.0.1",
-    port: 6379
-};
+const BASE_URL = "http://localhost:8080";
 
 const TOTAL_REQUESTS =
     Number(process.env.TOTAL_REQUESTS || 100);
@@ -20,37 +17,70 @@ const TOTAL_REQUESTS =
 const QUANTITY_PER_REQUEST =
     Number(process.env.QUANTITY_PER_REQUEST || 1);
 
-const POLL_INTERVAL_MS = 100;
+// ============================================================
+// INTERNAL CLIENT BEHAVIOUR
+// Do NOT change these for server-capacity experiments.
+// ============================================================
 
-const JOB_TIMEOUT_MS =
-    120_000;
+const POLL_CONCURRENCY = 10;
+const POLL_INTERVAL_MS = 500;
 
-const RUN_ID =
-    crypto.randomUUID();
+// One worker may legitimately need several minutes
+// to drain a large queue.
+const JOB_TIMEOUT_MS = 10 * 60 * 1000;
+
+const REQUEST_TIMEOUT_MS = 30 * 1000;
+
+const RUN_ID = crypto.randomUUID();
+
+// ============================================================
+// VALIDATION
+// ============================================================
 
 if (!TOKEN) {
-    console.error(
-        "TEST_TOKEN is missing."
-    );
-
+    console.error("TEST_TOKEN is missing.");
     console.error(
         'PowerShell: $env:TEST_TOKEN="YOUR_JWT"'
     );
-
     process.exit(1);
 }
 
-const orderQueue = new Queue(
-    "order-queue",
-    {
-        connection: REDIS_CONNECTION
-    }
-);
+if (!PRODUCT_ID) {
+    console.error("PRODUCT_ID is missing.");
+    console.error(
+        'PowerShell: $env:PRODUCT_ID="YOUR_PRODUCT_ID"'
+    );
+    process.exit(1);
+}
+
+if (
+    !Number.isInteger(TOTAL_REQUESTS) ||
+    TOTAL_REQUESTS <= 0
+) {
+    console.error(
+        "TOTAL_REQUESTS must be a positive integer."
+    );
+    process.exit(1);
+}
+
+if (
+    !Number.isInteger(QUANTITY_PER_REQUEST) ||
+    QUANTITY_PER_REQUEST <= 0
+) {
+    console.error(
+        "QUANTITY_PER_REQUEST must be a positive integer."
+    );
+    process.exit(1);
+}
+
+// ============================================================
+// HELPERS
+// ============================================================
 
 function sleep(ms) {
-    return new Promise(
-        resolve => setTimeout(resolve, ms)
-    );
+    return new Promise(resolve => {
+        setTimeout(resolve, ms);
+    });
 }
 
 function percentile(values, p) {
@@ -58,15 +88,13 @@ function percentile(values, p) {
         return 0;
     }
 
-    const sorted =
-        [...values].sort(
-            (a, b) => a - b
-        );
+    const sorted = [...values].sort(
+        (a, b) => a - b
+    );
 
     const index =
         Math.ceil(
-            (p / 100) *
-            sorted.length
+            (p / 100) * sorted.length
         ) - 1;
 
     return sorted[
@@ -78,9 +106,46 @@ function formatMs(value) {
     return `${value.toFixed(2)} ms`;
 }
 
-async function sendOrder(
-    requestNumber
+// ============================================================
+// HTTP HELPER
+// ============================================================
+
+async function fetchWithTimeout(
+    url,
+    options = {}
 ) {
+    const controller =
+        new AbortController();
+
+    const timeout =
+        setTimeout(() => {
+            controller.abort();
+        }, REQUEST_TIMEOUT_MS);
+
+    try {
+        return await fetch(
+            url,
+            {
+                ...options,
+                signal: controller.signal
+            }
+        );
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+// ============================================================
+// SEND ONE ORDER REQUEST
+//
+// This is the ONLY admission mechanism.
+// The server decides:
+//   Redis reservation
+//   BullMQ enqueue
+//   202 / 400 / 429 / etc.
+// ============================================================
+
+async function sendOrder(requestNumber) {
     const idempotencyKey =
         `flash-benchmark-${RUN_ID}-${requestNumber}`;
 
@@ -89,7 +154,7 @@ async function sendOrder(
 
     try {
         const response =
-            await fetch(
+            await fetchWithTimeout(
                 `${BASE_URL}/api/v1/orders`,
                 {
                     method: "POST",
@@ -124,8 +189,9 @@ async function sendOrder(
         let body;
 
         try {
-            body =
-                JSON.parse(bodyText);
+            body = JSON.parse(
+                bodyText
+            );
         } catch {
             body = {
                 raw: bodyText
@@ -135,6 +201,7 @@ async function sendOrder(
         return {
             requestNumber,
             idempotencyKey,
+
             status:
                 response.status,
 
@@ -151,6 +218,7 @@ async function sendOrder(
         return {
             requestNumber,
             idempotencyKey,
+
             status:
                 "NETWORK_ERROR",
 
@@ -165,56 +233,79 @@ async function sendOrder(
     }
 }
 
-async function getJobStatus(
-    jobId
-) {
-    const response =
-        await fetch(
-            `${BASE_URL}/api/v1/orders/jobs/${jobId}`,
-            {
-                headers: {
-                    "Authorization":
-                        `Bearer ${TOKEN}`
-                }
-            }
-        );
+// ============================================================
+// GET ONE JOB STATUS
+//
+// Again: HTTP only.
+// No BullMQ / Redis access here.
+// ============================================================
 
-    const bodyText =
-        await response.text();
-
-    let body;
-
+async function getJobStatus(jobId) {
     try {
-        body =
-            JSON.parse(bodyText);
-    } catch {
-        body = {
-            raw: bodyText
+        const response =
+            await fetchWithTimeout(
+                `${BASE_URL}/api/v1/orders/jobs/${jobId}`,
+                {
+                    headers: {
+                        "Authorization":
+                            `Bearer ${TOKEN}`
+                    }
+                }
+            );
+
+        const bodyText =
+            await response.text();
+
+        let body;
+
+        try {
+            body = JSON.parse(
+                bodyText
+            );
+        } catch {
+            body = {
+                raw: bodyText
+            };
+        }
+
+        return {
+            httpStatus:
+                response.status,
+
+            body
+        };
+
+    } catch (error) {
+        return {
+            httpStatus:
+                "NETWORK_ERROR",
+
+            body: {
+                message:
+                    error.message
+            }
         };
     }
-
-    return {
-        httpStatus:
-            response.status,
-
-        body
-    };
 }
 
-async function waitForJob(
-    jobId
-) {
+// ============================================================
+// WAIT FOR ONE JOB
+//
+// Only COMPLETED / FAILED stop polling.
+// 429/network errors are retried.
+// ============================================================
+
+async function waitForJob(item) {
     const start =
         performance.now();
 
     while (
-        performance.now() - start
-        <
+        performance.now() - start <
         JOB_TIMEOUT_MS
     ) {
         const result =
             await getJobStatus(
-                jobId
+                item.body.jobId
             );
 
         const status =
@@ -224,7 +315,16 @@ async function waitForJob(
             status === "COMPLETED" ||
             status === "FAILED"
         ) {
-            return result.body;
+            return {
+                requestNumber:
+                    item.requestNumber,
+
+                jobId:
+                    item.body.jobId,
+
+                result:
+                    result.body
+            };
         }
 
         await sleep(
@@ -233,22 +333,88 @@ async function waitForJob(
     }
 
     return {
-        status: "TIMEOUT"
+        requestNumber:
+            item.requestNumber,
+
+        jobId:
+            item.body.jobId,
+
+        result: {
+            status:
+                "TIMEOUT"
+        }
     };
 }
 
-async function collectQueueDepth() {
-    const counts =
-        await orderQueue.getJobCounts(
-            "waiting",
-            "active"
+// ============================================================
+// LIMITED-CONCURRENCY JOB POLLING
+//
+// Important:
+// We NEVER create 456/1000 simultaneous polling loops.
+//
+// At most 10 status requests are actively being monitored.
+// ============================================================
+
+async function waitForAllJobs(
+    acceptedResults
+) {
+    const results = [];
+
+    let nextIndex = 0;
+
+    const workerCount =
+        Math.min(
+            POLL_CONCURRENCY,
+            acceptedResults.length
         );
 
-    return (
-        Number(counts.waiting || 0) +
-        Number(counts.active || 0)
+    async function pollWorker() {
+        while (
+            nextIndex <
+            acceptedResults.length
+        ) {
+            const index =
+                nextIndex++;
+
+            const item =
+                acceptedResults[index];
+
+            const result =
+                await waitForJob(item);
+
+            results.push(result);
+
+            const completedCount =
+                results.length;
+
+            if (
+                completedCount % 50 === 0 ||
+                completedCount ===
+                acceptedResults.length
+            ) {
+                console.log(
+                    `Job progress: ${completedCount}/${acceptedResults.length}`
+                );
+            }
+        }
+    }
+
+    await Promise.all(
+        Array.from(
+            {
+                length:
+                    workerCount
+            },
+            () => pollWorker()
+        )
     );
+
+    return results;
 }
+
+// ============================================================
+// MAIN BENCHMARK
+// ============================================================
 
 async function run() {
     console.log(
@@ -256,7 +422,7 @@ async function run() {
     );
 
     console.log(
-        "        FLASH-SALE BENCHMARK"
+        "          FLASH-SALE BENCHMARK"
     );
 
     console.log(
@@ -264,47 +430,51 @@ async function run() {
     );
 
     console.log(
-        `Run ID:             ${RUN_ID}`
+        `Run ID:              ${RUN_ID}`
     );
 
     console.log(
-        `Requests:           ${TOTAL_REQUESTS}`
+        `Product ID:          ${PRODUCT_ID}`
     );
 
     console.log(
-        `Quantity/request:   ${QUANTITY_PER_REQUEST}`
+        `Requests:            ${TOTAL_REQUESTS}`
     );
 
     console.log(
-        "\nSending concurrent requests..."
+        `Quantity/request:    ${QUANTITY_PER_REQUEST}`
+    );
+
+    console.log(
+        `Poll concurrency:    ${POLL_CONCURRENCY}`
+    );
+
+    console.log(
+        "\nThe benchmark uses HTTP only."
+    );
+
+    // ========================================================
+    // PHASE 1
+    // ========================================================
+
+    console.log(
+        "\n=========================================="
+    );
+
+    console.log(
+        "       PHASE 1: API ADMISSION"
+    );
+
+    console.log(
+        "=========================================="
+    );
+
+    console.log(
+        `Sending ${TOTAL_REQUESTS} concurrent POST requests...`
     );
 
     const benchmarkStart =
         performance.now();
-
-    let maxQueueDepth = 0;
-
-    let sampling = true;
-
-    const sampler =
-        (async () => {
-            while (sampling) {
-                try {
-                    const depth =
-                        await collectQueueDepth();
-
-                    maxQueueDepth =
-                        Math.max(
-                            maxQueueDepth,
-                            depth
-                        );
-                } catch {
-                    // Ignore sampling errors.
-                }
-
-                await sleep(100);
-            }
-        })();
 
     const requestResults =
         await Promise.all(
@@ -323,10 +493,9 @@ async function run() {
     const requestPhaseEnd =
         performance.now();
 
-    /*
-        Stop queue sampling later,
-        after accepted jobs finish.
-    */
+    // ========================================================
+    // CLASSIFY
+    // ========================================================
 
     const accepted =
         requestResults.filter(
@@ -337,7 +506,6 @@ async function run() {
     const soldOut =
         requestResults.filter(
             result => {
-
                 const message =
                     String(
                         result.body?.message ||
@@ -361,19 +529,25 @@ async function run() {
                 result.status === 429
         );
 
+    const networkErrors =
+        requestResults.filter(
+            result =>
+                result.status ===
+                "NETWORK_ERROR"
+        );
+
     const other =
         requestResults.filter(
             result =>
                 !accepted.includes(result) &&
                 !soldOut.includes(result) &&
-                !rateLimited.includes(result)
+                !rateLimited.includes(result) &&
+                !networkErrors.includes(result)
         );
 
-    /*
-        ----------------------------------------
-        HTTP LATENCY
-        ----------------------------------------
-    */
+    // ========================================================
+    // HTTP METRICS
+    // ========================================================
 
     const httpLatencies =
         requestResults.map(
@@ -382,15 +556,15 @@ async function run() {
         );
 
     console.log(
-        "\n=========================================="
+        "\n------------------------------------------"
     );
 
     console.log(
-        "          HTTP / ADMISSION"
+        "HTTP / ADMISSION"
     );
 
     console.log(
-        "=========================================="
+        "------------------------------------------"
     );
 
     console.log(
@@ -406,7 +580,11 @@ async function run() {
     );
 
     console.log(
-        `Rate limited:       ${rateLimited.length}`
+        `Rate limited (429): ${rateLimited.length}`
+    );
+
+    console.log(
+        `Network errors:     ${networkErrors.length}`
     );
 
     console.log(
@@ -467,55 +645,94 @@ async function run() {
         ).toFixed(2)} req/s`
     );
 
-    /*
-        ----------------------------------------
-        JOB COMPLETION
-        ----------------------------------------
-    */
+    // ========================================================
+    // SHOW UNEXPECTED ERRORS
+    // ========================================================
+
+    if (
+        networkErrors.length > 0
+    ) {
+        console.log(
+            "\nNetwork errors:"
+        );
+
+        console.table(
+            networkErrors
+                .slice(0, 10)
+                .map(item => ({
+                    request:
+                        item.requestNumber,
+
+                    message:
+                        item.body?.message,
+
+                    latencyMs:
+                        item.latencyMs.toFixed(2)
+                }))
+        );
+    }
+
+    if (
+        other.length > 0
+    ) {
+        console.log(
+            "\nOther HTTP errors:"
+        );
+
+        console.table(
+            other
+                .slice(0, 10)
+                .map(item => ({
+                    request:
+                        item.requestNumber,
+
+                    status:
+                        item.status,
+
+                    message:
+                        item.body?.message ||
+                        item.body?.msg ||
+                        item.body?.error
+                }))
+        );
+    }
+
+    // ========================================================
+    // PHASE 2
+    // ========================================================
 
     console.log(
         "\n=========================================="
     );
 
     console.log(
-        "          BULLMQ WORKER"
+        "       PHASE 2: BULLMQ PROCESSING"
     );
 
     console.log(
         "=========================================="
     );
 
+    if (
+        accepted.length === 0
+    ) {
+        console.log(
+            "No jobs were accepted."
+        );
+    }
+
     console.log(
-        `Waiting for ${accepted.length} jobs...`
+        `Monitoring ${accepted.length} accepted jobs...`
     );
 
     const jobResults =
-        await Promise.all(
-            accepted.map(
-                async result => {
-
-                    const finalStatus =
-                        await waitForJob(
-                            result.body.jobId
-                        );
-
-                    return {
-                        requestNumber:
-                            result.requestNumber,
-
-                        jobId:
-                            result.body.jobId,
-
-                        result:
-                            finalStatus
-                    };
-                }
-            )
+        await waitForAllJobs(
+            accepted
         );
 
-    sampling = false;
-
-    await sampler;
+    // ========================================================
+    // JOB RESULTS
+    // ========================================================
 
     const completed =
         jobResults.filter(
@@ -538,79 +755,56 @@ async function run() {
                 "TIMEOUT"
         );
 
-    /*
-        ----------------------------------------
-        GET RAW BULLMQ TIMINGS
-        ----------------------------------------
-    */
-
-    const timings = [];
-
-    for (
-        const completedJob of completed
-    ) {
-        const job =
-            await orderQueue.getJob(
-                completedJob.jobId
-            );
-
-        if (!job) {
-            continue;
-        }
-
-        if (
-            job.timestamp == null ||
-            job.processedOn == null ||
-            job.finishedOn == null
-        ) {
-            continue;
-        }
-
-        timings.push({
-            jobId:
-                job.id,
-
-            queueWaitMs:
-                job.processedOn -
-                job.timestamp,
-
-            processingMs:
-                job.finishedOn -
-                job.processedOn,
-
-            totalJobMs:
-                job.finishedOn -
-                job.timestamp,
-
-            orderId:
-                job.returnvalue?.orderId
-        });
-    }
+    // ========================================================
+    // SERVER-PROVIDED TIMINGS
+    // ========================================================
 
     const queueWaits =
-        timings.map(
-            item =>
-                item.queueWaitMs
-        );
+        completed
+            .map(item =>
+                Number(
+                    item.result.queueWaitMs
+                )
+            )
+            .filter(
+                value =>
+                    Number.isFinite(value)
+            );
 
     const processingTimes =
-        timings.map(
-            item =>
-                item.processingMs
-        );
+        completed
+            .map(item =>
+                Number(
+                    item.result.processingMs
+                )
+            )
+            .filter(
+                value =>
+                    Number.isFinite(value)
+            );
 
     const totalJobTimes =
-        timings.map(
-            item =>
-                item.totalJobMs
-        );
+        completed
+            .map(item =>
+                Number(
+                    item.result.totalJobMs
+                )
+            )
+            .filter(
+                value =>
+                    Number.isFinite(value)
+            );
+
+    // ========================================================
+    // JOB PERFORMANCE
+    // ========================================================
 
     console.log(
         "\n=========================================="
     );
 
     console.log(
-        "          JOB PERFORMANCE"
+        "             JOB PERFORMANCE"
     );
 
     console.log(
@@ -633,11 +827,13 @@ async function run() {
         `Timed out:          ${timedOut.length}`
     );
 
-    console.log(
-        `Maximum queue depth:${maxQueueDepth}`
-    );
+    // --------------------------------------------------------
+    // QUEUE WAIT
+    // --------------------------------------------------------
 
-    if (queueWaits.length > 0) {
+    if (
+        queueWaits.length > 0
+    ) {
         console.log(
             "\nQueue wait time:"
         );
@@ -678,7 +874,13 @@ async function run() {
         );
     }
 
-    if (processingTimes.length > 0) {
+    // --------------------------------------------------------
+    // PROCESSING
+    // --------------------------------------------------------
+
+    if (
+        processingTimes.length > 0
+    ) {
         console.log(
             "\nWorker processing time:"
         );
@@ -709,9 +911,23 @@ async function run() {
                 )
             )}`
         );
+
+        console.log(
+            `max:                 ${formatMs(
+                Math.max(
+                    ...processingTimes
+                )
+            )}`
+        );
     }
 
-    if (totalJobTimes.length > 0) {
+    // --------------------------------------------------------
+    // TOTAL JOB LIFETIME
+    // --------------------------------------------------------
+
+    if (
+        totalJobTimes.length > 0
+    ) {
         console.log(
             "\nTotal job lifetime:"
         );
@@ -732,7 +948,6 @@ async function run() {
                     95
                 )
             )}`
-
         );
 
         console.log(
@@ -753,33 +968,45 @@ async function run() {
         );
     }
 
-    const completedJobIds =
-        timings
-            .map(item => item.jobId);
+    // ========================================================
+    // SAMPLE COMPLETED JOBS
+    // ========================================================
 
     if (
-        completedJobIds.length > 0
+        completed.length > 0
     ) {
-        const first =
-            timings.reduce(
-                (a, b) =>
-                    Math.min(
-                        a.queueWaitMs +
-                        b.totalJobMs,
-                        b.totalJobMs
-                    )
-            );
-
         console.log(
-            `\nWorker completion count: ${completedJobIds.length}`
+            "\nSample completed jobs:"
+        );
+
+        console.table(
+            completed
+                .slice(0, 10)
+                .map(item => ({
+                    request:
+                        item.requestNumber,
+
+                    jobId:
+                        item.jobId,
+
+                    orderId:
+                        item.result.orderId,
+
+                    queueWaitMs:
+                        item.result.queueWaitMs,
+
+                    processingMs:
+                        item.result.processingMs,
+
+                    totalJobMs:
+                        item.result.totalJobMs
+                }))
         );
     }
 
-    /*
-        ----------------------------------------
-        FINAL SUMMARY
-        ----------------------------------------
-    */
+    // ========================================================
+    // FINAL
+    // ========================================================
 
     const totalElapsed =
         performance.now() -
@@ -790,7 +1017,7 @@ async function run() {
     );
 
     console.log(
-        "              FINAL"
+        "                 FINAL"
     );
 
     console.log(
@@ -814,6 +1041,14 @@ async function run() {
     );
 
     console.log(
+        `Network errors:       ${networkErrors.length}`
+    );
+
+    console.log(
+        `Other errors:         ${other.length}`
+    );
+
+    console.log(
         `Jobs completed:       ${completed.length}`
     );
 
@@ -826,41 +1061,25 @@ async function run() {
     );
 
     console.log(
-        `Maximum queue depth:  ${maxQueueDepth}`
-    );
-
-    console.log(
         `Total benchmark time: ${formatMs(
             totalElapsed
         )}`
     );
 
-    if (
-        other.length > 0
-    ) {
-        console.log(
-            "\nOther errors:"
-        );
-
-        console.table(
-            other.slice(0, 10)
-        );
-    }
-
     console.log(
-        "\n==========================================\n"
+        "==========================================\n"
     );
 }
 
-run()
-    .catch(error => {
-        console.error(
-            "\nBenchmark failed:",
-            error
-        );
+// ============================================================
+// START
+// ============================================================
 
-        process.exitCode = 1;
-    })
-    .finally(async () => {
-        await orderQueue.close();
-    });
+run().catch(error => {
+    console.error(
+        "\nBenchmark failed:",
+        error
+    );
+
+    process.exitCode = 1;
+});

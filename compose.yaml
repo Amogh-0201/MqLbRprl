@@ -3,7 +3,7 @@ services:
   app1:
     build: .
     env_file:
-      - .env
+      - .env.local
     environment:
       PORT: 3000
       INSTANCE_ID: server-1
@@ -28,7 +28,7 @@ services:
   app2:
     build: .
     env_file:
-      - .env
+      - .env.local
     environment:
       PORT: 3000
       INSTANCE_ID: server-2
@@ -53,7 +53,7 @@ services:
   app3:
     build: .
     env_file:
-      - .env
+      - .env.local
     environment:
       PORT: 3000
       INSTANCE_ID: server-3
@@ -81,6 +81,10 @@ services:
       - "8080:80"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     depends_on:
       app1:
         condition: service_healthy
