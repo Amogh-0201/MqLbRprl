@@ -1,712 +1,1402 @@
-# MqLbRprl - Distributed Systems E-Commerce Backend
+# MqLbRprl
 
-[![Node.js](https://img.shields.io/badge/Node.js-v18+-green.svg)](https://nodejs.org/)
-[![Express](https://img.shields.io/badge/Express-5.x-lightgrey.svg)](https://expressjs.com/)
-[![MongoDB](https://img.shields.io/badge/MongoDB-Mongoose_9-green.svg)](https://mongoosejs.com/)
-[![License](https://img.shields.io/badge/License-ISC-blue.svg)](#)
+## Message Queue · Load Balancer · Reverse Proxy · Rate Limiting
 
-A modular, production-ready RESTful backend built with **Node.js**, **Express 5**, and **MongoDB (Mongoose)**. 
+A local distributed-systems lab built around a small e-commerce backend.
 
-### Why the name `mq_lb_rprl`?
-The name stands for the four pillars of scalable distributed systems that this repository is designed to integrate and demonstrate:
-- **MQ** &mdash; **M**essage **Q**ueuing (Asynchronous order & notification processing)
-- **LB** &mdash; **L**oad **B**alancing (Traffic distribution across cluster replicas)
-- **RP** &mdash; **R**everse **P**roxy (SSL termination, caching, and gateway routing)
-- **RL** &mdash; **R**ate **L**imiting (DDoS protection and fair resource usage)
+The project is designed to make four infrastructure mechanisms observable under load:
 
-While currently functioning as a complete e-commerce backend (Authentication, Product Catalog, Inventory Management, and Order Lifecycles), its architecture is structured to easily attach these infrastructure layers.
+- **MQ — Message Queue:** Redis + BullMQ buffer flash-sale order work.
+- **LB — Load Balancing:** Nginx distributes HTTP traffic across three Node/Express replicas.
+- **RP — Reverse Proxy:** Nginx is the only public HTTP entry point and forwards requests to the application replicas.
+- **RL — Rate Limiting:** Nginx applies per-IP request limits and controlled bursts.
 
----
+The same application deliberately uses **two different order-processing paths** so the effect of these mechanisms can be compared under different workloads.
 
-## Table of Contents
-- [Tech Stack](#tech-stack)
-- [Project Architecture](#project-architecture)
-- [Getting Started](#getting-started)
-  - [Prerequisites](#prerequisites)
-  - [Installation](#installation)
-  - [Environment Variables](#environment-variables)
-  - [Running the Server](#running-the-server)
-- [Authentication & Authorization](#authentication--authorization)
-- [API Reference](#api-reference)
-  - [Route Summary](#route-summary)
-  - [Authentication Endpoints](#authentication-endpoints)
-  - [Product Endpoints](#product-endpoints)
-  - [Order Endpoints](#order-endpoints)
-- [Data Models & Schema](#data-models--schema)
-- [Order Lifecycle & Inventory State Machine](#order-lifecycle--inventory-state-machine)
-- [Error Handling Standards](#error-handling-standards)
-- [Scalability Roadmap (MQ, LB, RP, RL)](#scalability-roadmap-mq-lb-rp-rl)
+> This repository is a **reproducible local lab**, not a claim that a single laptop is production-scale infrastructure. The measured numbers in this README are observations from one local Docker environment.
 
 ---
 
-## Tech Stack
+## What the project demonstrates
 
-| Layer | Technology | Description |
-|---|---|---|
-| **Runtime** | Node.js (v18+) | Non-blocking, event-driven JavaScript engine |
-| **Framework** | Express 5.x | Web framework with native async error handling |
-| **Database** | MongoDB & Mongoose 9 | Document database with strict schema modeling |
-| **Authentication** | JWT & bcryptjs | Stateless token auth & secure salt hashing |
-| **Validation** | Joi & Mongoose Validators | Payload validation & schema type checks |
+### 1. Normal sustained traffic
 
----
+Normal orders remain synchronous:
 
-## Project Architecture
-
+```text
+Client
+  ↓
+Nginx
+  ↓
+app1 / app2 / app3
+  ↓
+MongoDB transaction
+  ↓
+201 Created
 ```
-mq_lb_rprl/
-├── controllers/          # HTTP request handlers & response orchestration
+
+The order request performs the inventory check, stock decrement, and order creation before the HTTP response is returned.
+
+This path is intentionally useful for measuring how a request-path MongoDB workload behaves as request rate increases.
+
+### 2. Flash-sale traffic
+
+Flash-sale orders use an asynchronous admission path:
+
+```text
+Client
+  ↓
+Nginx
+  ↓
+app1 / app2 / app3
+  ↓
+Redis atomic reservation
+  ↓
+BullMQ / Redis
+  ↓
+order-worker
+  ↓
+MongoDB transaction
+  ↓
+Order persisted
+```
+
+The client receives:
+
+```text
+202 Accepted + jobId
+```
+
+and can later query:
+
+```text
+GET /api/v1/orders/jobs/:jobId
+```
+
+The important design decision is that **the HTTP connection does not remain open while the worker processes the order**.
+
+---
+
+# Architecture
+
+```mermaid
+flowchart LR
+
+    C["Client / Load Test"] --> N["Nginx<br/>Reverse Proxy + Rate Limit + Load Balancer"]
+
+    N --> A1["app1<br/>Express"]
+    N --> A2["app2<br/>Express"]
+    N --> A3["app3<br/>Express"]
+
+    A1 --> R["Redis"]
+    A2 --> R
+    A3 --> R
+
+    R --> Q["BullMQ<br/>order-queue"]
+
+    Q --> W["order-worker"]
+
+    W --> M["MongoDB<br/>Replica Set"]
+
+    A1 --> M
+    A2 --> M
+    A3 --> M
+```
+
+### Network boundaries
+
+| Component | Host access | Container access |
+|---|---|---|
+| Nginx | `localhost:8080` | `:80` |
+| MongoDB | `127.0.0.1:27018` | `mongo:27017` |
+| Redis | `127.0.0.1:6379` | `redis:6379` |
+| app1/app2/app3 | not public | `:3000` |
+| order-worker | not public | consumes BullMQ jobs |
+
+The application replicas are intentionally not exposed directly to the host. Clients use the Nginx entry point.
+
+---
+
+# Why the name `MqLbRprl`
+
+| Pillar | Meaning | Implementation |
+|---|---|---|
+| **MQ** | Message Queue | Redis + BullMQ `order-queue` + `order-worker` |
+| **LB** | Load Balancing | Nginx upstream with `app1`, `app2`, `app3` |
+| **RP** | Reverse Proxy | Nginx forwards client requests to the Node replicas |
+| **RL** | Rate Limiting | Nginx `limit_req` zones |
+
+There is also an older `load-balancer.js` in the repository. It is an earlier learning implementation and is **not used by the Docker stack**. Nginx is the active load balancer.
+
+---
+
+# Core design: two order paths
+
+## Normal order path
+
+When a product is not in a flash sale:
+
+```text
+POST /api/v1/orders
+        ↓
+    Nginx
+        ↓
+  Express replica
+        ↓
+  placeOrder()
+        ↓
+MongoDB transaction
+   ├─ verify product
+   ├─ conditionally decrement stock
+   └─ insert order
+        ↓
+    201 Created
+```
+
+The inventory update is protected by an atomic stock condition:
+
+```text
+quantity >= requestedQuantity
+```
+
+followed by an atomic decrement.
+
+The product update and order creation are performed in the same MongoDB transaction.
+
+### What the queue is NOT doing here
+
+Normal orders are not forced through BullMQ.
+
+That is deliberate. The project compares:
+
+- synchronous request-path persistence for normal traffic
+- asynchronous queued persistence for flash-sale traffic
+
+---
+
+# Flash-sale order path
+
+When a product is in flash-sale mode:
+
+```text
+POST /api/v1/orders
+        ↓
+    Nginx
+        ↓
+  Express replica
+        ↓
+Redis Lua reservation
+   ├─ reserve → continue
+   └─ insufficient → 400
+        ↓
+BullMQ job
+        ↓
+202 Accepted + jobId
+        ↓
+order-worker
+        ↓
+same MongoDB order transaction
+        ↓
+Redis reservation → COMPLETED
+```
+
+The client can then poll:
+
+```text
+GET /api/v1/orders/jobs/:jobId
+```
+
+and observe:
+
+```text
+PENDING
+PROCESSING
+COMPLETED
+FAILED
+```
+
+The completed response can include:
+
+- queue wait time
+- worker processing time
+- total job lifetime
+- created order ID
+
+---
+
+# Inventory correctness
+
+One of the main goals of the lab is to verify that sudden load does **not create more orders than available stock**.
+
+## Normal orders
+
+MongoDB protects the durable inventory using an atomic conditional update inside the transaction.
+
+## Flash-sale orders
+
+Redis performs the fast admission decision.
+
+The reservation is performed by a Lua script so the check and decrement happen atomically:
+
+```text
+read available stock
+        ↓
+check stock >= requested quantity
+        ↓
+decrement stock
+        ↓
+write reservation record
+```
+
+Only requests that successfully reserve inventory become BullMQ jobs.
+
+This is why the queue does not itself prevent overselling.
+
+> **Overselling prevention comes from atomic inventory control.**
+>
+> **BullMQ provides buffering and controlled asynchronous processing.**
+
+The flash-sale design intentionally allows Redis reservation state and MongoDB durable stock to be temporarily different while jobs are waiting in the queue. Once the jobs finish successfully, MongoDB and the Redis reservation accounting are reconciled before the flash sale is ended.
+
+---
+
+# Idempotency
+
+Flash-sale requests require an:
+
+```http
+Idempotency-Key: <unique-key>
+```
+
+A deterministic reservation ID is derived from the authenticated user and idempotency key.
+
+This gives repeated submissions of the same logical request a stable identity.
+
+The order model also stores an idempotency key with a unique sparse index.
+
+This is important because BullMQ jobs may be retried after transient worker/database failures.
+
+---
+
+# Failure handling
+
+The queue is configured with retries and exponential backoff:
+
+```text
+attempts: 3
+backoff: exponential
+```
+
+The worker:
+
+1. receives a job
+2. runs the normal MongoDB order transaction
+3. marks the Redis reservation as completed
+4. returns the created order ID
+
+For a final worker failure, the implementation attempts to release an unresolved Redis reservation so the reserved unit is not permanently trapped.
+
+The flash-sale lifecycle also prevents ending a sale while product-specific jobs are still waiting or active, and checks Redis/Mongo inventory consistency before deactivation.
+
+---
+
+# Nginx
+
+Nginx is the public entry point:
+
+```text
+http://localhost:8080
+```
+
+It currently provides:
+
+- reverse proxying
+- load balancing
+- request rate limiting
+- upstream failure handling
+- request forwarding headers
+- connection capacity for large local bursts
+
+The active configuration uses:
+
+```nginx
+worker_processes auto;
+
+events {
+    worker_connections 8192;
+}
+```
+
+and the Docker Compose service allows a high open-file limit.
+
+## Current request limits
+
+These are server-side Nginx settings, not benchmark settings.
+
+| Route | Rate | Burst | Purpose |
+|---|---:|---:|---|
+| Exact `/api/v1/orders` location | `1000 r/s` | `1000` | high-volume order admission experiments |
+| `/api/v1/orders/jobs/...` | `100 r/s` | `200` | controlled job-status polling |
+| `/api/v1/auth/...` | `2 r/s` | `5` | protect authentication endpoints |
+| Other `/api/...` routes | `20 r/s` | `50` | protect normal API traffic |
+
+All limits are keyed by client IP.
+
+Because the load generator runs from one laptop, all benchmark requests share the same IP bucket.
+
+> The exact Nginx location for `/api/v1/orders` is path-based. The benchmark workload uses `POST /api/v1/orders`.
+
+---
+
+# Load balancing
+
+The active Nginx upstream contains:
+
+```text
+app1:3000
+app2:3000
+app3:3000
+```
+
+Every application response exposes:
+
+```http
+X-INSTANCE-ID
+```
+
+so load distribution can be observed directly.
+
+For example:
+
+```text
+server-1
+server-2
+server-3
+```
+
+The upstream uses passive failure handling through `max_fails` and `fail_timeout`.
+
+Docker health checks also gate application startup and Nginx dependency startup.
+
+This is intentionally a local demonstration of replica routing, not a claim of a full service-discovery or active-health-check production platform.
+
+---
+
+# Redis
+
+Redis is used for flash-sale admission state.
+
+Per-product flash-sale state includes:
+
+```text
+flash-sale:active:<productId>
+flash-sale:stock:<productId>
+flash-sale:reservation:<reservationId>
+```
+
+Redis is therefore a fast temporary admission layer.
+
+MongoDB remains the durable source of truth for persisted product and order records.
+
+Redis is **not** used to mirror every normal product quantity update.
+
+Flash-sale stock is initialized when the flash sale starts.
+
+---
+
+# BullMQ
+
+BullMQ provides the asynchronous `order-queue`.
+
+Default job behaviour includes:
+
+- 3 attempts
+- exponential backoff
+- automatic cleanup of old completed jobs
+- automatic cleanup of old failed jobs
+
+The benchmark client does not add jobs directly.
+
+The normal path is:
+
+```text
+HTTP request
+    ↓
+orderController
+    ↓
+orderQueue.add(...)
+```
+
+The worker is the separate consumer:
+
+```text
+order-worker
+    ↓
+BullMQ Worker("order-queue")
+```
+
+Multiple worker processes can consume from the same shared queue.
+
+---
+
+# MongoDB
+
+The Docker environment uses a local MongoDB replica set because the order service uses transactions.
+
+The local database is:
+
+```text
+mqlbrprl
+```
+
+The container connection uses:
+
+```text
+mongodb://mongo:27017/mqlbrprl?replicaSet=rs0
+```
+
+The host-side mapped MongoDB port is:
+
+```text
+127.0.0.1:27018
+```
+
+The local benchmark environment keeps load-test writes away from Atlas.
+
+---
+
+# Project structure
+
+```text
+MqLbRprl/
+│
+├── controllers/
 │   ├── authController.js
 │   ├── orderController.js
 │   └── productController.js
-├── db/                   # Database connection configuration
+│
+├── db/
 │   └── connectDb.js
-├── error_handlers/       # Custom OOP error hierarchy (400, 401, 403, 404, 500)
+│
+├── error_handlers/
 │   ├── BadRequestError.js
 │   ├── CustomApiError.js
 │   ├── ForbiddenError.js
 │   ├── NotFoundError.js
+│   ├── ServiceUnavailableError.js
 │   └── UnAuthenticatedError.js
-├── middlewares/          # Express middleware pipeline
+│
+├── middlewares/
 │   ├── authentication.js
 │   ├── errorhandler_middleware.js
 │   └── not_found.js
-├── models/               # Mongoose schemas with lifecycle hooks & validation
+│
+├── models/
 │   ├── order.js
 │   ├── product.js
 │   └── user.js
-├── routes/               # API route definitions
+│
+├── nginx/
+│   └── nginx.conf
+│
+├── queues/
+│   └── orderQueue.js
+│
+├── routes/
 │   ├── authRoute.js
 │   ├── orderRoute.js
 │   └── productRoute.js
-├── services/             # Core business logic & database interactions
+│
+├── scripts/
+│   ├── setup-benchmark.js
+│   ├── start-flash-sale.js
+│   ├── end-flash-sale.js
+│   ├── flash-sale-test.js
+│   ├── normal-rps-test.js
+│   └── queue-status.js
+│
+├── services/
 │   ├── authService.js
+│   ├── flashSaleService.js
+│   ├── inventoryService.js
 │   ├── orderService.js
 │   └── productService.js
-├── app.js                # Application entry point & server bootstrap
+│
+├── tests/
+│   ├── auth.test.js
+│   ├── products.test.js
+│   └── orders.test.js
+│
+├── utils/
+│   └── orderRequestId.js
+│
+├── workers/
+│   └── orderWorker.js
+│
+├── app.js
+├── compose.yaml
+├── Dockerfile
+├── load-balancer.js
 ├── package.json
 └── README.md
 ```
 
+### Important files
+
+| File | Responsibility |
+|---|---|
+| `nginx/nginx.conf` | reverse proxy, load balancing, rate limits |
+| `controllers/orderController.js` | selects normal vs flash-sale order path |
+| `services/orderService.js` | durable MongoDB order logic |
+| `services/inventoryService.js` | Redis reservation logic and Lua scripts |
+| `services/flashSaleService.js` | start/end flash-sale lifecycle |
+| `queues/orderQueue.js` | BullMQ queue definition |
+| `workers/orderWorker.js` | asynchronous order processor |
+| `scripts/flash-sale-test.js` | burst HTTP benchmark |
+| `scripts/normal-rps-test.js` | paced synchronous RPS benchmark |
+| `scripts/setup-benchmark.js` | deterministic benchmark data reset |
+
 ---
 
-## Getting Started
+# Running locally
 
-### Prerequisites
-- [Node.js](https://nodejs.org/) (v18 or higher recommended)
-- [MongoDB Atlas](https://www.mongodb.com/cloud/atlas) or local MongoDB instance
+## Prerequisites
 
-### Installation
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/Amogh-0201/MqLbRprl.git
-   cd MqLbRprl
-   ```
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
+- Docker Desktop with Compose v2
+- Node.js 18+ on the host for the load scripts and Jest
+- PowerShell on Windows, or bash/zsh on macOS/Linux
 
-### Environment Variables
-Create a `.env` file in the root directory:
-```env
-PORT=3000
-MONGO_URI=mongodb+srv://<username>:<password>@cluster.mongodb.net/mq_lb_rprl?retryWrites=true&w=majority
-JWT_SECRET=your_super_secret_jwt_key_here
+The Docker image uses a current Node Alpine runtime; the host only needs a supported Node version capable of running the benchmark scripts.
+
+---
+
+# Environment
+
+Create the local container environment file:
+
+```text
+.env.local
 ```
 
-### Running the Server
-- **Development mode (with auto-restart via Nodemon)**:
-  ```bash
-  npm run dev
-  ```
-- **Production mode**:
-  ```bash
-  npm start
-  ```
+Example:
 
-### Running Tests
-The project uses Jest with Supertest for in-process HTTP requests against the exported Express app. The route tests are integration tests: they exercise the middleware, controllers, services, and MongoDB together. MongoDB is provided by `mongodb-memory-server`, so the tests never connect to your Atlas cluster or modify its data.
+```env
+MONGO_URI=mongodb://mongo:27017/mqlbrprl?replicaSet=rs0
+JWT_SECRET=replace-with-a-long-random-secret
+REDIS_HOST=redis
+REDIS_PORT=6379
+WORKER_CONCURRENCY=5
+```
 
-To execute all route and application tests across Auth, Products, and Orders:
+Do not commit `.env.local`.
+
+Use the Compose file explicitly with:
+
+```bash
+docker compose --env-file .env.local up -d --build
+```
+
+This is important because the worker's Compose configuration interpolates `MONGO_URI` and `WORKER_CONCURRENCY`.
+
+---
+
+# Start the stack
+
+```bash
+docker compose --env-file .env.local up -d --build
+```
+
+Check:
+
+```bash
+docker compose ps
+```
+
+Expected services:
+
+```text
+app1
+app2
+app3
+nginx
+redis
+mongo
+order-worker
+```
+
+---
+
+# Initialize the MongoDB replica set
+
+The local MongoDB container runs as a single-member replica set so MongoDB transactions are available.
+
+Run once:
+
+```bash
+docker compose exec mongo mongosh --quiet --eval "try { rs.status().ok } catch(e) { rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'mongo:27017' }] }).ok }"
+```
+
+Check:
+
+```bash
+docker compose exec mongo mongosh --quiet --eval "rs.status().members.map(m => ({name:m.name,stateStr:m.stateStr}))"
+```
+
+The member should become:
+
+```text
+PRIMARY
+```
+
+---
+
+# Verify the proxy
+
+```bash
+curl http://localhost:8080/health
+```
+
+Example:
+
+```json
+{
+  "status": "ok",
+  "instanceId": "server-1",
+  "pid": 123
+}
+```
+
+Repeat several times and observe the `instanceId` change as Nginx distributes requests across replicas.
+
+---
+
+# Automated tests
+
+The Jest/Supertest suites use `mongodb-memory-server`.
+
+They are isolated from:
+
+- Docker MongoDB
+- Atlas
+- Redis
+- Nginx
+
+Run:
+
 ```bash
 npm test
 ```
-The test command runs files sequentially to keep the in-memory database lifecycle predictable.
-To run a specific test suite file:
+
+Or an individual suite:
+
 ```bash
 npx jest tests/auth.test.js --runInBand
 npx jest tests/products.test.js --runInBand
 npx jest tests/orders.test.js --runInBand
 ```
 
-Each suite starts a temporary MongoDB process, connects Mongoose to it, and stops it during teardown. No test database name or test MongoDB Atlas credentials are required. The first run may download the MongoDB binary used by `mongodb-memory-server`.
+These tests verify application behaviour. They are separate from the Docker load experiments.
 
 ---
 
-## Authentication & Authorization
+# Benchmark workflow
 
-All protected routes require an **HTTP Bearer Token** in the request headers:
+The benchmark scripts run on the host but talk to:
+
+```text
+http://localhost:8080
+```
+
+That means every measured request goes through the real Nginx → Node → Redis/Mongo path.
+
+The flash-sale benchmark does **not** create or inspect BullMQ jobs directly.
+
+---
+
+# Benchmark data setup
+
+Use the dedicated benchmark product so repeated experiments do not affect normal application data.
+
+```bash
+node scripts/setup-benchmark.js <stock>
+```
+
+Examples:
+
+```bash
+node scripts/setup-benchmark.js 10
+node scripts/setup-benchmark.js 1000
+node scripts/setup-benchmark.js 50
+```
+
+The script resets:
+
+- benchmark admin
+- benchmark user
+- benchmark product
+- old orders for that benchmark product
+- product stock
+- flash-sale state
+
+It also prints a fresh benchmark JWT and product ID.
+
+---
+
+# Flash-sale benchmark
+
+Set the host variables printed by `setup-benchmark.js`:
+
+```powershell
+$env:TEST_TOKEN="PASTE_USER_JWT"
+$env:PRODUCT_ID="PASTE_PRODUCT_ID"
+```
+
+Set the number of client requests:
+
+```powershell
+$env:TOTAL_REQUESTS="1000"
+```
+
+Then start the flash sale:
+
+```powershell
+node scripts/start-flash-sale.js $env:PRODUCT_ID
+```
+
+Run:
+
+```powershell
+node scripts/flash-sale-test.js
+```
+
+The benchmark only sends HTTP requests to:
+
+```text
+POST /api/v1/orders
+```
+
+and then monitors accepted jobs through:
+
+```text
+GET /api/v1/orders/jobs/:jobId
+```
+
+After the queue is idle:
+
+```powershell
+node scripts/queue-status.js
+node scripts/end-flash-sale.js $env:PRODUCT_ID
+```
+
+---
+
+# Flash-sale benchmark matrix
+
+| Test | Requests | Stock | Nginx order rate | Worker concurrency | Purpose |
+|---|---:|---:|---:|---:|---|
+| A | 100 | 10 | 1000/s | 1 | inventory correctness under burst |
+| B | 100 | 10 | 1000/s | 5 | same inventory limit with more worker concurrency |
+| C | 1000 | 1000 | 1000/s | 1 | queue drain with one worker |
+| D | 1000 | 1000 | 1000/s | 5 | queue drain with five-way concurrency |
+| E | 1000 | 1000 | 1000/s | 10 | higher worker concurrency |
+| F | 1000 | 1000 | 1000/s | 20 | aggressive concurrency |
+| G | 1000 | 1000 | 1000/s | 8 | intermediate concurrency |
+| H | 5000 | 50 | 1000/s | 5 | inventory cap plus Nginx rate limiting |
+| I | 10000 | 50 | 1000/s | 5 | very high client-side connection pressure |
+
+All flash-sale runs use quantity `1` per request.
+
+---
+
+# Recorded flash-sale results
+
+These figures are from one local Windows/Docker run.
+
+They are useful for comparing the architecture on that machine; they are not universal performance guarantees.
+
+## Inventory correctness: stock = 10
+
+| | Test A | Test B |
+|---|---:|---:|
+| Worker concurrency | 1 | 5 |
+| Requests | 100 | 100 |
+| Accepted `202` | 10 | 10 |
+| Sold out `400` | 90 | 90 |
+| Rate limited `429` | 0 | 0 |
+| Network errors | 0 | 0 |
+| Jobs completed | 10 | 10 |
+| Jobs failed | 0 | 0 |
+| HTTP p50 | 278.53 ms | 223.24 ms |
+| HTTP throughput | 253.68 req/s | 314.27 req/s |
+| Queue wait p50 | 221 ms | 20 ms |
+| Worker process p50 | 34 ms | 97 ms |
+| Total benchmark | 970.75 ms | 881.03 ms |
+
+**Observed result:** 10 units were admitted and 10 orders completed in both runs. There was no observed overselling.
+
+The extra worker mainly changed queue wait on this small workload.
+
+---
+
+## Drain 1000 accepted jobs
+
+| | C | D | G | E | F |
+|---|---:|---:|---:|---:|---:|
+| Workers | 1 | 5 | 8 | 10 | 20 |
+| `202 / 400 / 429 / network` | 1000 / 0 / 0 / 0 | 1000 / 0 / 0 / 0 | 1000 / 0 / 0 / 0 | 1000 / 0 / 0 / 0 | 1000 / 0 / 0 / 0 |
+| HTTP p50 | 2821.15 ms | 2748.07 ms | 2693.13 ms | 2723.16 ms | 2554.07 ms |
+| HTTP throughput | 261.17/s | 264.32/s | 275.36/s | 260.94/s | 294.99/s |
+| Queue wait p50 | 9201 ms | **6573 ms** | 7153 ms | 7789 ms | 9883 ms |
+| Queue wait p95 | 16530 ms | **10995 ms** | 12130 ms | 13216 ms | 17174 ms |
+| Worker process p50 | **18 ms** | 34 ms | 47 ms | 50 ms | 91 ms |
+| Worker process p95 | 39 ms | 205 ms | 391 ms | 664 ms | 2454 ms |
+| Job lifetime p50 | 9222 ms | **6701 ms** | 7282 ms | 7903 ms | 10241 ms |
+| Total benchmark | 21529 ms | **15888 ms** | 16864 ms | 18004 ms | 22244 ms |
+
+Every request was admitted and every accepted job completed.
+
+On this machine, five concurrent worker jobs produced the shortest overall queue-drain time among these recorded configurations. Higher concurrency increased processing-time tails, indicating contention rather than unlimited improvement from adding concurrency.
+
+---
+
+## High-pressure burst
+
+### Test H
+
+```text
+Requests:          5000
+Stock:             50
+Worker:            5
+Accepted 202:      50
+Sold out 400:      3313
+Rate limited 429:  1637
+Network errors:    0
+Jobs completed:    50
+Jobs failed:       0
+```
+
+The request results sum exactly to the 5000 requests.
+
+The 50 accepted requests produced 50 completed jobs.
+
+**No overselling was observed.**
+
+The `429` responses came from the Nginx rate-limiting policy once the offered burst exceeded its configured budget.
+
+### Test I
+
+```text
+Requests:          10000
+Stock:             50
+Worker:            5
+Accepted 202:      50
+Sold out 400:      589
+Rate limited 429:  0
+Network errors:    9361
+Jobs completed:    50
+Jobs failed:       0
+```
+
+Again, the accepted jobs completed without exceeding the 50-unit stock.
+
+The large number of network errors means this run should **not** be described as a clean 10,000-request server-capacity result. The load generator opened a very large number of host-side connections at once, so client/socket pressure became part of the experiment.
+
+---
+
+# Normal sustained-RPS benchmark
+
+Flash sale must be inactive.
+
+The normal benchmark is an open-loop generator:
+
+```text
+target RPS
+   ↓
+schedule request starts
+   ↓
+send POST /api/v1/orders
+```
+
+It does not wait for the previous request to finish before scheduling the next arrival.
+
+This makes it useful for observing sustained request-path pressure.
+
+The `STOCK` value is prepared in MongoDB before the run. The benchmark itself does not modify stock.
+
+---
+
+# Normal-RPS test matrix
+
+| Test | Target | Duration | Stock | Requests launched |
+|---|---:|---:|---:|---:|
+| 1 | 50/s | 30 s | 1200 | 1500 |
+| 2 | 100/s | 30 s | 2600 | 3000 |
+| 3 | 150/s | 30 s | 4400 | 4500 |
+| 4 | 200/s | 30 s | 5700 | 6000 |
+| 5 | 250/s | 30 s | 7450 | 7500 |
+| 6 | 300/s | 30 s | 8000 | 9000 |
+
+All runs use quantity `1` per request.
+
+Stock is intentionally below the number of launches so the run also exercises the insufficient-stock path.
+
+---
+
+# Recorded normal-RPS results
+
+## Test 1 — 50 RPS
+
+```text
+Requests launched:    1500
+Target RPS:              50.00
+Actual offered RPS:      50.03
+
+201 success:           1200
+400 insufficient:       300
+429 rate limited:         0
+5xx errors:               0
+Network errors:          0
+Other errors:             0
+
+Response throughput:    50.00 responses/s
+
+HTTP p50:               14.12 ms
+HTTP p95:               22.96 ms
+HTTP p99:               40.83 ms
+HTTP max:              202.21 ms
+```
+
+1200 successful orders exactly consumed the 1200 available units.
+
+---
+
+## Test 2 — 100 RPS
+
+```text
+Requests launched:    3000
+Target RPS:             100.00
+Actual offered RPS:     100.03
+
+201 success:           2600
+400 insufficient:       400
+429 rate limited:         0
+5xx errors:               0
+Network errors:          0
+Other errors:             0
+
+Response throughput:   100.01 responses/s
+
+HTTP p50:               13.72 ms
+HTTP p95:               20.63 ms
+HTTP p99:               58.77 ms
+HTTP max:              214.89 ms
+```
+
+2600 successful orders exactly consumed the 2600 available units.
+
+---
+
+## Tests 3–6
+
+At 150 RPS and above, the runs began producing network errors on the local machine.
+
+Those runs are **not treated as clean capacity measurements** in this README.
+
+The important observation is:
+
+> The system was clean at the recorded 50 RPS and 100 RPS runs, while higher offered rates introduced client/network failures that require further resource-level profiling to attribute precisely.
+
+That profiling would include Docker CPU/memory, MongoDB behaviour, Nginx connection usage, and host socket pressure.
+
+---
+
+# What the measurements actually show
+
+The flash-sale experiments demonstrate a separation between:
+
+### Admission
+
+Handled by:
+
+```text
+Nginx
++
+Redis atomic reservation
++
+BullMQ enqueue
+```
+
+### Persistence
+
+Handled later by:
+
+```text
+order-worker
++
+MongoDB transaction
+```
+
+This means worker throughput and HTTP admission are different measurements.
+
+For example:
+
+```text
+1000 incoming requests
+        ↓
+1000 HTTP 202 responses
+        ↓
+1000 queued jobs
+        ↓
+1 worker drains queue
+```
+
+A single worker can therefore be slow without forcing the original HTTP requests to remain open.
+
+Increasing worker concurrency changes **queue-drain behaviour**, not the fundamental Redis inventory rule.
+
+---
+
+# Why the queue exists
+
+MongoDB's atomic inventory update already prevents the classic overselling race.
+
+The message queue solves a different problem.
+
+Without a queue:
+
+```text
+1000 clients
+    ↓
+1000 requests
+    ↓
+1000 expensive synchronous database operations
+```
+
+With the flash-sale path:
+
+```text
+1000 clients
+    ↓
+fast Redis admission
+    ↓
+1000 lightweight queue entries
+    ↓
+controlled worker concurrency
+    ↓
+MongoDB
+```
+
+The queue therefore acts as a **buffer between admission and durable processing**.
+
+This is especially useful when requests arrive much faster than the database-backed worker layer can safely process them.
+
+---
+
+# Benchmark scripts
+
+| Script | Purpose |
+|---|---|
+| `setup-benchmark.js` | creates/resets dedicated benchmark user, admin, product, stock, and old benchmark orders |
+| `start-flash-sale.js` | copies Mongo stock into Redis and activates flash-sale mode |
+| `end-flash-sale.js` | verifies idle queue and Redis/Mongo inventory consistency before deactivation |
+| `flash-sale-test.js` | sends a burst of HTTP order requests and monitors accepted jobs |
+| `normal-rps-test.js` | sends a paced open-loop stream of synchronous orders |
+| `queue-status.js` | optional inspection of BullMQ waiting/active/completed/failed/delayed counts |
+
+The load generators are intentionally external clients.
+
+The flash-sale benchmark does **not** insert BullMQ jobs directly.
+
+---
+
+# API overview
+
+Base URL:
+
+```text
+http://localhost:8080
+```
+
+## Authentication
+
 ```http
-Authorization: Bearer <your_jwt_token>
+Authorization: Bearer <jwt>
 ```
 
-### Roles
-- **`user`**: Can browse products, view product details, place orders, update quantities on pending orders, view their own order history, and cancel pending orders.
-- **`admin`**: Can create new products, update/delete products they created, view orders placed for their products, and transition order statuses (`pending` &rarr; `packed` &rarr; `in transit` &rarr; `delivered` or `failed`).
+## Main routes
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `POST` | `/api/v1/auth/register` | register user/admin |
+| `POST` | `/api/v1/auth/login` | obtain JWT |
+| `GET` | `/api/v1/auth/me` | current user |
+| `GET` | `/api/v1/products` | list products |
+| `GET` | `/api/v1/products/:productId` | product details |
+| `POST` | `/api/v1/products` | create product |
+| `PATCH` | `/api/v1/products/:productId` | update product |
+| `DELETE` | `/api/v1/products/:productId` | delete product |
+| `POST` | `/api/v1/orders` | normal `201` or flash-sale `202` |
+| `GET` | `/api/v1/orders/jobs/:jobId` | flash-sale job status |
+| `GET` | `/api/v1/orders` | list orders |
+| `GET` | `/api/v1/orders/:orderId` | order details |
+| `PATCH` | `/api/v1/orders/:orderId/quantity` | update pending order |
+| `PATCH` | `/api/v1/orders/:orderId/status` | admin order status |
+| `DELETE` | `/api/v1/orders/:orderId` | cancel pending order |
+| `GET` | `/health` | instance health |
 
 ---
 
-## API Reference
+# Order responses
 
-### Route Summary
+## Normal order
 
-| Method | Endpoint | Auth | Role | Description |
-|---|---|---|---|---|
-| `POST` | `/api/v1/auth/register` | No | Public | Register a new user or admin |
-| `POST` | `/api/v1/auth/login` | No | Public | Authenticate and obtain JWT token |
-| `GET` | `/api/v1/auth/me` | Yes | Any | Retrieve authenticated profile |
-| `GET` | `/api/v1/products` | No | Public | List all available products |
-| `GET` | `/api/v1/products/:productId` | No | Public | Get single product details |
-| `POST` | `/api/v1/products` | Yes | `admin` | Create a new product |
-| `PATCH` | `/api/v1/products/:productId` | Yes | `admin` (Owner) | Update existing product details |
-| `DELETE` | `/api/v1/products/:productId` | Yes | `admin` (Owner) | Delete a product (if no active orders) |
-| `POST` | `/api/v1/orders` | Yes | `user` | Place a new order & deduct stock |
-| `GET` | `/api/v1/orders` | Yes | `user` / `admin` | Fetch user's orders or admin's product orders |
-| `GET` | `/api/v1/orders/:orderId` | Yes | `user` (Owner) / `admin` | Get detailed order by ID |
-| `PATCH` | `/api/v1/orders/:orderId/quantity` | Yes | `user` (Owner) | Update pending order quantity |
-| `PATCH` | `/api/v1/orders/:orderId/status` | Yes | `admin` (Owner) | Update order status |
-| `DELETE` | `/api/v1/orders/:orderId` | Yes | `user` (Owner) | Cancel pending order & restore stock |
-
----
-
-### Authentication Endpoints
-
-#### 1. Register User / Admin
-- **Endpoint**: `POST /api/v1/auth/register`
-- **Auth**: Public
-- **Request Body**:
-  ```json
-  {
-    "name": "Jane Doe",
-    "email": "jane@example.com",
-    "password": "securepassword123",
-    "address": "123 Main Street, Metropolis",
-    "role": "user"
-  }
-  ```
-  *(Note: `role` is optional and defaults to `"user"`. Pass `"admin"` to register an administrator).*
-- **Success Response** (`201 Created`):
-  ```json
-  {
-    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-  }
-  ```
-- **Error Responses**:
-  - `400 Bad Request`: Missing required fields or email already in use.
-
----
-
-#### 2. User Login
-- **Endpoint**: `POST /api/v1/auth/login`
-- **Auth**: Public
-- **Request Body**:
-  ```json
-  {
-    "email": "jane@example.com",
-    "password": "securepassword123"
-  }
-  ```
-- **Success Response** (`200 OK`):
-  ```json
-  {
-    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-  }
-  ```
-- **Error Responses**:
-  - `400 Bad Request`: Missing credentials.
-  - `401 Unauthorized`: Invalid email or password.
-
----
-
-#### 3. Get Current User Profile
-- **Endpoint**: `GET /api/v1/auth/me`
-- **Auth**: Bearer Token
-- **Success Response** (`200 OK`):
-  ```json
-  {
-    "user": {
-      "_id": "65e63892a0e4c6b8c9d1a101",
-      "name": "Jane Doe",
-      "email": "jane@example.com",
-      "address": "123 Main Street, Metropolis",
-      "role": "user",
-      "createdAt": "2026-03-04T12:00:00.000Z",
-      "updatedAt": "2026-03-04T12:00:00.000Z",
-      "__v": 0
-    }
-  }
-  ```
-  *(Password hash is automatically omitted from the response).*
-
----
-
-### Product Endpoints
-
-#### 1. List All Products
-- **Endpoint**: `GET /api/v1/products`
-- **Auth**: Public
-- **Success Response** (`200 OK`):
-  ```json
-  {
-    "count": 2,
-    "products": [
-      {
-        "_id": "65e63914a0e4c6b8c9d1a105",
-        "adminId": "65e63892a0e4c6b8c9d1a100",
-        "name": "Mechanical Keyboard",
-        "price": 89.99,
-        "quantity": 25,
-        "image": "https://example.com/images/keyboard.png",
-        "description": "RGB mechanical keyboard with red switches",
-        "createdAt": "2026-03-04T12:05:00.000Z",
-        "updatedAt": "2026-03-04T12:05:00.000Z"
-      }
-    ]
-  }
-  ```
-
----
-
-#### 2. Get Single Product
-- **Endpoint**: `GET /api/v1/products/:productId`
-- **Auth**: Public
-- **URL Parameters**:
-  - `productId` (string, required): 24-character hexadecimal MongoDB ObjectId
-- **Success Response** (`200 OK`):
-  ```json
-  {
-    "product": {
-      "_id": "65e63914a0e4c6b8c9d1a105",
-      "adminId": "65e63892a0e4c6b8c9d1a100",
-      "name": "Mechanical Keyboard",
-      "price": 89.99,
-      "quantity": 25,
-      "image": "https://example.com/images/keyboard.png",
-      "description": "RGB mechanical keyboard with red switches",
-      "createdAt": "2026-03-04T12:05:00.000Z",
-      "updatedAt": "2026-03-04T12:05:00.000Z"
-    }
-  }
-  ```
-- **Error Responses**:
-  - `400 Bad Request`: Invalid ObjectId format.
-  - `404 Not Found`: Product does not exist.
-
----
-
-#### 3. Create Product
-- **Endpoint**: `POST /api/v1/products`
-- **Auth**: Bearer Token (`admin` only)
-- **Request Body**:
-  ```json
-  {
-    "name": "Wireless Mouse",
-    "price": 49.99,
-    "quantity": 50,
-    "image": "https://example.com/images/mouse.png",
-    "description": "Ergonomic 2.4GHz wireless mouse"
-  }
-  ```
-- **Validation Rules**:
-  - `name`: String, 3 to 100 characters (Required)
-  - `price`: Number, greater than 0 (Required)
-  - `quantity`: Non-negative integer &ge; 0 (Required)
-  - `image`: String (Optional)
-  - `description`: String (Optional)
-- **Success Response** (`201 Created`):
-  ```json
-  {
-    "msg": "Product created successfully",
-    "product": {
-      "_id": "65e63980a0e4c6b8c9d1a110",
-      "adminId": "65e63892a0e4c6b8c9d1a100",
-      "name": "Wireless Mouse",
-      "price": 49.99,
-      "quantity": 50,
-      "image": "https://example.com/images/mouse.png",
-      "description": "Ergonomic 2.4GHz wireless mouse",
-      "createdAt": "2026-03-04T12:10:00.000Z",
-      "updatedAt": "2026-03-04T12:10:00.000Z"
-    }
-  }
-  ```
-- **Error Responses**:
-  - `401 Unauthorized`: Token missing or invalid.
-  - `403 Forbidden`: Authenticated user is not an admin.
-
----
-
-#### 4. Update Product
-- **Endpoint**: `PATCH /api/v1/products/:productId`
-- **Auth**: Bearer Token (`admin` who created the product)
-- **URL Parameters**:
-  - `productId` (string, required): 24-character hexadecimal MongoDB ObjectId
-- **Request Body** (at least one field required):
-  ```json
-  {
-    "price": 44.99,
-    "quantity": 75
-  }
-  ```
-- **Success Response** (`200 OK`):
-  ```json
-  {
-    "msg": "Product updated successfully",
-    "updatedProduct": {
-      "_id": "65e63980a0e4c6b8c9d1a110",
-      "name": "Wireless Mouse",
-      "price": 44.99,
-      "quantity": 75,
-      "image": "https://example.com/images/mouse.png",
-      "description": "Ergonomic 2.4GHz wireless mouse",
-      "updatedAt": "2026-03-04T12:15:00.000Z"
-    }
-  }
-  ```
-- **Error Responses**:
-  - `400 Bad Request`: Validation failure on payload.
-  - `403 Forbidden`: Calling admin is not the creator of this product.
-  - `404 Not Found`: Product ID not found.
-
----
-
-#### 5. Delete Product
-- **Endpoint**: `DELETE /api/v1/products/:productId`
-- **Auth**: Bearer Token (`admin` who created the product)
-- **URL Parameters**:
-  - `productId` (string, required): 24-character hexadecimal MongoDB ObjectId
-- **Success Response** (`200 OK`):
-  ```json
-  {
-    "msg": "Product deleted successfully"
-  }
-  ```
-- **Error Responses**:
-  - `400 Bad Request`: Cannot delete product with active pending/in-transit orders.
-  - `403 Forbidden`: Calling admin is not the creator of this product.
-  - `404 Not Found`: Product ID not found.
-
----
-
-### Order Endpoints
-
-#### 1. Place an Order
-- **Endpoint**: `POST /api/v1/orders`
-- **Auth**: Bearer Token (`user` only)
-- **Request Body**:
-  ```json
-  {
-    "productId": "65e63980a0e4c6b8c9d1a110",
-    "quantity": 2
-  }
-  ```
-- **Validation Rules**:
-  - `productId`: Valid MongoDB ObjectId (Required)
-  - `quantity`: Positive integer &ge; 1 (Required)
-- **Success Response** (`201 Created`):
-  ```json
-  {
-    "msg": "Order placed successfully",
-    "order": {
-      "_id": "65e63a12a0e4c6b8c9d1a120",
-      "user": "65e63892a0e4c6b8c9d1a101",
-      "product": {
-        "_id": "65e63980a0e4c6b8c9d1a110",
-        "name": "Wireless Mouse",
-        "price": 44.99,
-        "image": "https://example.com/images/mouse.png",
-        "description": "Ergonomic 2.4GHz wireless mouse"
-      },
-      "quantity": 2,
-      "price": 89.98,
-      "orderStatus": "pending",
-      "createdAt": "2026-03-04T12:20:00.000Z",
-      "updatedAt": "2026-03-04T12:20:00.000Z"
-    }
-  }
-  ```
-- **Error Responses**:
-  - `400 Bad Request`: Insufficient stock or invalid quantity format.
-  - `403 Forbidden`: Admin/seller role attempting to place orders.
-  - `404 Not Found`: Product not found.
-
----
-
-#### 2. Get All Orders
-- **Endpoint**: `GET /api/v1/orders`
-- **Auth**: Bearer Token
-  - When called by a **`user`**: Returns all orders placed by that user.
-  - When called by an **`admin`**: Returns all orders placed for products managed by that admin (with customer information populated).
-- **Success Response** (`200 OK`):
-  ```json
-  {
-    "count": 1,
-    "orders": [
-      {
-        "_id": "65e63a12a0e4c6b8c9d1a120",
-        "user": {
-          "_id": "65e63892a0e4c6b8c9d1a101",
-          "name": "Jane Doe",
-          "email": "jane@example.com",
-          "address": "123 Main Street"
-        },
-        "product": {
-          "_id": "65e63980a0e4c6b8c9d1a110",
-          "name": "Wireless Mouse",
-          "price": 44.99,
-          "image": "https://example.com/images/mouse.png",
-          "description": "Ergonomic 2.4GHz wireless mouse"
-        },
-        "quantity": 2,
-        "price": 89.98,
-        "orderStatus": "pending",
-        "createdAt": "2026-03-04T12:20:00.000Z"
-      }
-    ]
-  }
-  ```
-
----
-
-#### 3. Get Order by ID
-- **Endpoint**: `GET /api/v1/orders/:orderId`
-- **Auth**: Bearer Token (`user` owner or `admin` owning product)
-- **URL Parameters**:
-  - `orderId` (string, required): 24-character hexadecimal MongoDB ObjectId
-- **Success Response** (`200 OK`):
-  ```json
-  {
-    "order": {
-      "_id": "65e63a12a0e4c6b8c9d1a120",
-      "user": "65e63892a0e4c6b8c9d1a101",
-      "product": {
-        "_id": "65e63980a0e4c6b8c9d1a110",
-        "name": "Wireless Mouse",
-        "price": 44.99,
-        "image": "https://example.com/images/mouse.png",
-        "description": "Ergonomic 2.4GHz wireless mouse"
-      },
-      "quantity": 2,
-      "price": 89.98,
-      "orderStatus": "pending",
-      "createdAt": "2026-03-04T12:20:00.000Z"
-    }
-  }
-  ```
-- **Error Responses**:
-  - `403 Forbidden`: Calling user/admin does not own or manage this order.
-  - `404 Not Found`: Order ID not found.
-
----
-
-#### 4. Update Order Quantity
-- **Endpoint**: `PATCH /api/v1/orders/:orderId/quantity`
-- **Auth**: Bearer Token (`user` who placed the order)
-- **URL Parameters**:
-  - `orderId` (string, required): 24-character hexadecimal MongoDB ObjectId
-- **Request Body**:
-  ```json
-  {
-    "quantity": 4
-  }
-  ```
-- **Rules**:
-  - Can only be updated if `orderStatus` is `"pending"`.
-  - Product stock is automatically adjusted by the difference: if quantity increases, remaining stock is decremented; if decreased, excess stock is returned.
-- **Success Response** (`200 OK`):
-  ```json
-  {
-    "msg": "Order quantity updated successfully",
-    "order": {
-      "_id": "65e63a12a0e4c6b8c9d1a120",
-      "quantity": 4,
-      "price": 179.96,
-      "orderStatus": "pending"
-    }
-  }
-  ```
-- **Error Responses**:
-  - `400 Bad Request`: Order is not in "pending" status, or insufficient inventory.
-  - `403 Forbidden`: Calling user does not own the order.
-
----
-
-#### 5. Update Order Status
-- **Endpoint**: `PATCH /api/v1/orders/:orderId/status`
-- **Auth**: Bearer Token (`admin` who owns the product)
-- **URL Parameters**:
-  - `orderId` (string, required): 24-character hexadecimal MongoDB ObjectId
-- **Request Body**:
-  ```json
-  {
-    "orderStatus": "packed"
-  }
-  ```
-  *(Allowed values: `"pending"`, `"packed"`, `"in transit"`, `"delivered"`, `"failed"`)*
-- **Rules**:
-  - Once an order is `"delivered"` or `"failed"`, it cannot be updated.
-  - If status is changed to `"failed"`, the reserved inventory quantity is automatically returned to the product stock.
-- **Success Response** (`200 OK`):
-  ```json
-  {
-    "msg": "Order status updated successfully",
-    "order": {
-      "_id": "65e63a12a0e4c6b8c9d1a120",
-      "orderStatus": "packed",
-      "updatedAt": "2026-03-04T12:30:00.000Z"
-    }
-  }
-  ```
-- **Error Responses**:
-  - `400 Bad Request`: Invalid status transition or order already finalized.
-  - `403 Forbidden`: Admin does not own the ordered product.
-
----
-
-#### 6. Cancel / Delete Order
-- **Endpoint**: `DELETE /api/v1/orders/:orderId`
-- **Auth**: Bearer Token (`user` who placed the order)
-- **URL Parameters**:
-  - `orderId` (string, required): 24-character hexadecimal MongoDB ObjectId
-- **Rules**:
-  - Can only be deleted if `orderStatus` is `"pending"`.
-  - The reserved product quantity is automatically replenished in inventory.
-- **Success Response** (`200 OK`):
-  ```json
-  {
-    "msg": "Order deleted successfully"
-  }
-  ```
-- **Error Responses**:
-  - `400 Bad Request`: Order is already packed, shipped, or delivered.
-  - `403 Forbidden`: Not the order owner.
-  - `404 Not Found`: Order ID not found.
-
----
-
-## Data Models & Schema
-
-```mermaid
-erDiagram
-    USER ||--o{ PRODUCT : creates
-    USER ||--o{ ORDER : places
-    PRODUCT ||--o{ ORDER : ordered_in
-
-    USER {
-        ObjectId _id PK
-        string name
-        string email UK
-        string password
-        string address
-        string role "user | admin"
-        date createdAt
-        date updatedAt
-    }
-
-    PRODUCT {
-        ObjectId _id PK
-        ObjectId adminId FK
-        string name
-        number price
-        number quantity
-        string image
-        string description
-        date createdAt
-        date updatedAt
-    }
-
-    ORDER {
-        ObjectId _id PK
-        ObjectId user FK
-        ObjectId product FK
-        number quantity
-        number price
-        string orderStatus "pending | packed | in transit | delivered | failed"
-        date createdAt
-        date updatedAt
-    }
+```http
+201 Created
 ```
 
----
+with the created order document.
 
-## Order Lifecycle & Inventory State Machine
+## Flash-sale order
 
-```mermaid
-stateDiagram-v2
-    [*] --> Pending : User places order (Stock deducted)
-    
-    Pending --> Pending : User updates quantity (Stock adjusted +/-)
-    Pending --> [*] : User deletes order (Stock restored)
-    
-    Pending --> Packed : Admin updates status
-    Packed --> InTransit : Admin updates status
-    InTransit --> Delivered : Admin updates status (Terminal)
-    
-    Pending --> Failed : Admin marks failed (Stock restored, Terminal)
-    Packed --> Failed : Admin marks failed (Stock restored, Terminal)
-    InTransit --> Failed : Admin marks failed (Stock restored, Terminal)
+```http
+202 Accepted
 ```
 
----
-
-## Error Handling Standards
-
-All errors conform to predictable, structured JSON responses:
+with:
 
 ```json
 {
-  "error": "Descriptive error message"
+  "success": true,
+  "msg": "Order request accepted for processing",
+  "jobId": "order-...",
+  "status": "PENDING"
 }
 ```
 
-| HTTP Code | Error Class | Typical Trigger |
-|---|---|---|
-| `400` | `BadRequestError` | Validation error, negative price/qty, insufficient stock, duplicate key |
-| `401` | `UnAuthenticatedError` | Missing Bearer token, expired token, incorrect credentials |
-| `403` | `ForbiddenError` | Role restriction (e.g. non-admin creating product), unauthorized resource edit |
-| `404` | `NotFoundError` | Product or Order ID does not exist in the database |
-| `500` | Internal Server Error | Unexpected database or server crash |
+## Sold out
+
+```http
+400 Bad Request
+```
+
+with:
+
+```text
+Insufficient Stock
+```
+
+## Rate limited
+
+```http
+429 Too Many Requests
+```
+
+from Nginx.
+
+## Temporary infrastructure failure
+
+For example, an uninitialized/unavailable flash-sale inventory layer can produce:
+
+```http
+503 Service Unavailable
+```
 
 ---
 
-## Scalability Roadmap (MQ, LB, RP, RL)
+# Order lifecycle
 
-This backend serves as the foundation for testing and integrating key distributed systems components:
+```mermaid
+stateDiagram-v2
 
-### 1. 📬 Message Queuing (MQ)
-*Target: RabbitMQ / Apache Kafka / Redis Streams*
-- **Problem**: Synchronous order placement couples inventory check, database write, payment confirmation, and notification delivery in a single HTTP request. Under heavy load (e.g., flash sales), this leads to connection exhaustion.
-- **Solution**:
-  - When `POST /api/v1/orders` is received, push an `OrderCreatedEvent` to a message queue and return `202 Accepted` immediately.
-  - Dedicated consumer worker processes handle atomic inventory deduction, payment capture, and notification delivery asynchronously.
+    [*] --> Pending : order accepted
 
-### 2. ⚖️ Load Balancing (LB)
-*Target: Nginx / HAProxy / AWS ALB*
-- **Problem**: A single Node.js instance runs on a single thread and cannot saturate multi-core CPUs.
-- **Solution**:
-  - Run multiple Node.js server instances across distinct ports (e.g., `3001`, `3002`, `3003`).
-  - Configure a load balancer with **Round-Robin** or **Least Connections** algorithms with periodic health checks (`GET /health`).
+    Pending --> Pending : user changes quantity
+    Pending --> [*] : user cancels
 
-### 3. 🛡️ Reverse Proxy (RP)
-*Target: Nginx / Cloudflare / Envoy*
-- **Problem**: Exposing the application server directly risks DDOS attacks, lacks response caching for hot endpoints, and complicates SSL management.
-- **Solution**:
-  - Deploy a reverse proxy in front of the Node.js application to handle SSL/TLS termination, gzip/brotli compression, and caching for `GET /api/v1/products`.
+    Pending --> Packed : admin
+    Packed --> InTransit : admin
+    InTransit --> Delivered : terminal
 
-### 4. ⏱️ Rate Limiting (RL)
-*Target: Redis + Express Rate Limit / Token Bucket Algorithm*
-- **Problem**: Malicious actors or crawlers can spam `/api/v1/auth/login` (brute-force) or rapidly deplete inventory via bot orders.
-- **Solution**:
-  - Implement a **Sliding Window** or **Token Bucket** algorithm backed by Redis.
-  - Strict limits on Auth endpoints (e.g., 10 requests per 15 minutes per IP) and Orders (e.g., 5 orders per minute per user).
+    Pending --> Failed : admin
+    Packed --> Failed : admin
+    InTransit --> Failed : admin
+```
+
+Inventory restoration happens for the cancellation/failure cases supported by the service rules.
+
+During an active flash sale, inventory-changing order/product operations are restricted so Redis and MongoDB do not drift because of unrelated mutations.
+
+---
+
+# What is intentionally not implemented
+
+This project focuses on the four named infrastructure mechanisms and their interaction.
+
+It intentionally does not implement:
+
+- payment processing
+- email/notification delivery
+- TLS termination
+- WebSocket job updates
+- distributed deployment across multiple physical machines
+- multi-region replication
+- a full active-health-check/service-discovery system
+- per-user or tenant-aware rate limiting
+- an external managed load generator
+- automatic horizontal worker autoscaling
+
+Nginx is HTTP-only in the local lab.
+
+The rate limits are per client IP.
+
+The recorded performance numbers are tied to one machine and one Docker environment.
+
+---
+
+# Reproducing the flash-sale experiment
+
+## Example: 100 requests, stock 10
+
+```powershell
+node scripts/setup-benchmark.js 10
+```
+
+Set the generated benchmark credentials:
+
+```powershell
+$env:TEST_TOKEN="PASTE_USER_JWT"
+$env:PRODUCT_ID="PASTE_PRODUCT_ID"
+$env:TOTAL_REQUESTS="100"
+```
+
+Start:
+
+```powershell
+node scripts/start-flash-sale.js $env:PRODUCT_ID
+```
+
+Run:
+
+```powershell
+node scripts/flash-sale-test.js
+```
+
+Expected inventory result:
+
+```text
+100 requests
+10 accepted
+90 insufficient stock
+10 jobs completed
+```
+
+No overselling should occur.
+
+---
+
+## Example: 1000 requests, stock 1000
+
+```powershell
+node scripts/setup-benchmark.js 1000
+```
+
+Set the generated values:
+
+```powershell
+$env:TEST_TOKEN="PASTE_USER_JWT"
+$env:PRODUCT_ID="PASTE_PRODUCT_ID"
+$env:TOTAL_REQUESTS="1000"
+```
+
+Start the sale:
+
+```powershell
+node scripts/start-flash-sale.js $env:PRODUCT_ID
+```
+
+Run:
+
+```powershell
+node scripts/flash-sale-test.js
+```
+
+Then wait for the worker to drain the queue.
+
+The main comparison variable is the server's worker concurrency.
+
+---
+
+# Reproducing the normal-RPS experiment
+
+First make sure flash sale is inactive.
+
+Prepare the stock:
+
+```powershell
+node scripts/setup-benchmark.js 1200
+```
+
+Set:
+
+```powershell
+$env:TEST_TOKEN="PASTE_USER_JWT"
+$env:PRODUCT_ID="PASTE_PRODUCT_ID"
+$env:TARGET_RPS="50"
+$env:DURATION_SEC="30"
+$env:STOCK="1200"
+```
+
+Run:
+
+```powershell
+node scripts/normal-rps-test.js
+```
+
+Then repeat with the matrix values.
+
+---
+
+# Final takeaways
+
+This project is built around one central systems problem:
+
+> How should an e-commerce backend behave when demand arrives much faster than the durable processing layer can safely handle?
+
+The implementation answers that with different mechanisms at different stages:
+
+```text
+Nginx
+  ↓
+Rate limiting + reverse proxy + load balancing
+  ↓
+Node/Express replicas
+  ↓
+Redis atomic admission for flash sales
+  ↓
+BullMQ
+  ↓
+Controlled worker concurrency
+  ↓
+MongoDB transactions
+```
+
+The normal path remains synchronous so its request-path behaviour can be measured independently.
+
+The flash-sale path moves expensive persistence work behind a queue so a burst can be admitted quickly without turning every incoming request into an immediate MongoDB transaction.
+
+The recorded experiments show:
+
+- **No overselling in the recorded flash-sale runs.**
+- Inventory admission remained capped by available stock.
+- 1000 accepted flash-sale requests could be buffered and completed asynchronously.
+- Worker concurrency changed queue-drain time rather than inventory correctness.
+- Nginx rate limiting produced controlled `429` responses under extreme offered load.
+- Very large client-side bursts eventually introduced network/socket failures, demonstrating that the load generator and host can themselves become part of the bottleneck.
+
+The numbers are therefore best read as a **systems experiment**, not as a universal benchmark.
+
+---
+
+## License
+
+ISC
