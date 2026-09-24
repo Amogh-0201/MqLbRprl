@@ -1,4 +1,4 @@
-# MqLbRprl
+﻿# MqLbRprl
 
 ## Message Queue · Load Balancer · Reverse Proxy · Rate Limiting
 
@@ -511,12 +511,16 @@ MqLbRprl/
 │   └── productRoute.js
 │
 ├── scripts/
-│   ├── setup-benchmark.js
-│   ├── start-flash-sale.js
+│   ├── add-order-job.js
 │   ├── end-flash-sale.js
+│   ├── flash-sale-rps-test.js
 │   ├── flash-sale-test.js
 │   ├── normal-rps-test.js
-│   └── queue-status.js
+│   ├── queue-status.js
+│   ├── redis-reservation-test.js
+│   ├── redis-test.js
+│   ├── setup-benchmark.js
+│   └── start-flash-sale.js
 │
 ├── services/
 │   ├── authService.js
@@ -526,9 +530,11 @@ MqLbRprl/
 │   └── productService.js
 │
 ├── tests/
+│   ├── app.test.js
 │   ├── auth.test.js
+│   ├── orders.test.js
 │   ├── products.test.js
-│   └── orders.test.js
+│   └── testHelper.js
 │
 ├── utils/
 │   └── orderRequestId.js
@@ -555,8 +561,9 @@ MqLbRprl/
 | `services/flashSaleService.js` | start/end flash-sale lifecycle |
 | `queues/orderQueue.js` | BullMQ queue definition |
 | `workers/orderWorker.js` | asynchronous order processor |
-| `scripts/flash-sale-test.js` | burst HTTP benchmark |
-| `scripts/normal-rps-test.js` | paced synchronous RPS benchmark |
+| `scripts/flash-sale-test.js` | one-shot burst benchmark (all requests fired at once) |
+| `scripts/flash-sale-rps-test.js` | sustained flash-sale RPS benchmark (constant rate over a time window) |
+| `scripts/normal-rps-test.js` | sustained normal-order RPS benchmark |
 | `scripts/setup-benchmark.js` | deterministic benchmark data reset |
 
 ---
@@ -745,7 +752,9 @@ It also prints a fresh benchmark JWT and product ID.
 
 ---
 
-# Flash-sale benchmark
+# Flash-sale burst benchmark (`flash-sale-test.js`)
+
+This script fires all requests simultaneously in a single burst and then monitors accepted jobs. Good for testing inventory correctness and Nginx rate-limiting under instant load.
 
 Set the host variables printed by `setup-benchmark.js`:
 
@@ -772,18 +781,6 @@ Run:
 node scripts/flash-sale-test.js
 ```
 
-The benchmark only sends HTTP requests to:
-
-```text
-POST /api/v1/orders
-```
-
-and then monitors accepted jobs through:
-
-```text
-GET /api/v1/orders/jobs/:jobId
-```
-
 After the queue is idle:
 
 ```powershell
@@ -792,6 +789,128 @@ node scripts/end-flash-sale.js $env:PRODUCT_ID
 ```
 
 ---
+
+# Flash-sale sustained-RPS benchmark (`flash-sale-rps-test.js`)
+
+This script generates a **constant stream** of flash-sale order requests at a configurable rate over a configurable time window. It is the right tool for finding where the stack starts to saturate under prolonged load, rather than an instant spike.
+
+> **Use this script for Tests J and K.**
+
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `TEST_TOKEN` | required | JWT for the benchmark buyer |
+| `PRODUCT_ID` | required | product to order |
+| `TARGET_RPS` | `1000` | requests per second to generate |
+| `DURATION_SEC` | `30` | how long to sustain the rate |
+| `STOCK` | `50` | informational — used for the inventory warning check |
+| `QUANTITY_PER_REQUEST` | `1` | units per order |
+| `POLL_JOBS` | `true` | set `false` to skip job monitoring (faster admission-only tests) |
+| `JOB_TIMEOUT_MS` | `600000` | ms to wait for a job before marking it timed out |
+| `BASE_URL` | `http://localhost:8080` | target URL |
+
+### Setup
+
+```powershell
+node scripts/setup-benchmark.js 8000
+```
+
+Set the generated credentials:
+
+```powershell
+$env:TEST_TOKEN="PASTE_USER_JWT"
+$env:PRODUCT_ID="PASTE_PRODUCT_ID"
+```
+
+Start the flash sale:
+
+```powershell
+node scripts/start-flash-sale.js $env:PRODUCT_ID
+```
+
+### Run at 500 RPS for 30 s
+
+```powershell
+$env:TARGET_RPS="500"
+$env:DURATION_SEC="30"
+$env:STOCK="8000"
+node scripts/flash-sale-rps-test.js
+```
+
+### Run at 550 RPS for 30 s
+
+```powershell
+$env:TARGET_RPS="550"
+$env:DURATION_SEC="30"
+$env:STOCK="8000"
+node scripts/flash-sale-rps-test.js
+```
+
+After the queue drains:
+
+```powershell
+node scripts/queue-status.js
+node scripts/end-flash-sale.js $env:PRODUCT_ID
+```
+
+---
+
+# Normal sustained-RPS benchmark (`normal-rps-test.js`)
+
+This script generates a **constant open-loop stream** of normal (non-flash-sale) order requests at a configurable rate over a configurable time window. It does not wait for the previous request to complete before scheduling the next one, which makes it useful for observing realistic sustained request-path pressure on MongoDB.
+
+> Flash sale must be **inactive** before running this script.
+
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `TEST_TOKEN` | required | JWT for the benchmark buyer |
+| `PRODUCT_ID` | required | product to order |
+| `TARGET_RPS` | `50` | requests per second to generate |
+| `DURATION_SEC` | `30` | how long to sustain the rate |
+| `STOCK` | `1000` | informational — used for the inventory warning check |
+| `QUANTITY_PER_REQUEST` | `1` | units per order |
+| `BASE_URL` | `http://localhost:8080` | target URL |
+
+### Setup
+
+Prepare stock high enough to last the full run:
+
+```powershell
+node scripts/setup-benchmark.js 1200
+```
+
+Set the generated credentials:
+
+```powershell
+$env:TEST_TOKEN="PASTE_USER_JWT"
+$env:PRODUCT_ID="PASTE_PRODUCT_ID"
+```
+
+### Run at 50 RPS for 30 s
+
+```powershell
+$env:TARGET_RPS="50"
+$env:DURATION_SEC="30"
+$env:STOCK="1200"
+node scripts/normal-rps-test.js
+```
+
+### Run at 100 RPS for 30 s
+
+```powershell
+node scripts/setup-benchmark.js 2600
+$env:TARGET_RPS="100"
+$env:DURATION_SEC="30"
+$env:STOCK="2600"
+node scripts/normal-rps-test.js
+```
+
+Then repeat with the matrix values (150, 200, 250, 300 RPS), re-running `setup-benchmark.js` with enough stock each time.
+
+> **Note:** At 150 RPS and above on a single Docker machine, network/socket errors from the host begin to appear. These are client-side resource exhaustion issues, not application bugs — see the [bottleneck analysis](#%EF%B8%8F-analyzing-the-bottlenecks-why-do-network-errors-happen) for details.
 
 # Flash-sale benchmark matrix
 
@@ -1224,13 +1343,14 @@ This is especially useful when requests arrive much faster than the database-bac
 | `setup-benchmark.js` | creates/resets dedicated benchmark user, admin, product, stock, and old benchmark orders |
 | `start-flash-sale.js` | copies Mongo stock into Redis and activates flash-sale mode |
 | `end-flash-sale.js` | verifies idle queue and Redis/Mongo inventory consistency before deactivation |
-| `flash-sale-test.js` | sends a burst of HTTP order requests and monitors accepted jobs |
-| `normal-rps-test.js` | sends a paced open-loop stream of synchronous orders |
+| `flash-sale-test.js` | **one-shot burst** — fires all requests simultaneously and monitors accepted jobs |
+| `flash-sale-rps-test.js` | **sustained flash-sale RPS** — generates a constant request rate over a configurable time window |
+| `normal-rps-test.js` | **sustained normal-order RPS** — open-loop paced stream of synchronous orders |
 | `queue-status.js` | optional inspection of BullMQ waiting/active/completed/failed/delayed counts |
 
 The load generators are intentionally external clients.
 
-The flash-sale benchmark does **not** insert BullMQ jobs directly.
+The flash-sale benchmarks do **not** insert BullMQ jobs directly.
 
 ---
 
@@ -1378,9 +1498,11 @@ The recorded performance numbers are tied to one machine and one Docker environm
 
 ---
 
-# Reproducing the flash-sale experiment
+# Reproducing the experiments
 
-## Example: 100 requests, stock 10
+## Reproducing the flash-sale burst experiment
+
+### Example: 100 requests, stock 10 (inventory correctness check)
 
 ```powershell
 node scripts/setup-benchmark.js 10
@@ -1394,7 +1516,7 @@ $env:PRODUCT_ID="PASTE_PRODUCT_ID"
 $env:TOTAL_REQUESTS="100"
 ```
 
-Start:
+Start the flash sale:
 
 ```powershell
 node scripts/start-flash-sale.js $env:PRODUCT_ID
@@ -1419,7 +1541,7 @@ No overselling should occur.
 
 ---
 
-## Example: 1000 requests, stock 1000
+### Example: 1000 requests, stock 1000 (queue drain concurrency comparison)
 
 ```powershell
 node scripts/setup-benchmark.js 1000
@@ -1433,7 +1555,7 @@ $env:PRODUCT_ID="PASTE_PRODUCT_ID"
 $env:TOTAL_REQUESTS="1000"
 ```
 
-Start the sale:
+Start the flash sale:
 
 ```powershell
 node scripts/start-flash-sale.js $env:PRODUCT_ID
@@ -1445,39 +1567,91 @@ Run:
 node scripts/flash-sale-test.js
 ```
 
-Then wait for the worker to drain the queue.
-
-The main comparison variable is the server's worker concurrency.
+Then wait for the worker to drain the queue. The main comparison variable is the server's `WORKER_CONCURRENCY` setting.
 
 ---
 
-# Reproducing the normal-RPS experiment
+## Reproducing the sustained flash-sale RPS experiment (Tests J & K)
 
-First make sure flash sale is inactive.
+### Setup: stock 8000 (to avoid inventory exhaustion during the rate test)
 
-Prepare the stock:
+```powershell
+node scripts/setup-benchmark.js 8000
+```
+
+Set credentials:
+
+```powershell
+$env:TEST_TOKEN="PASTE_USER_JWT"
+$env:PRODUCT_ID="PASTE_PRODUCT_ID"
+```
+
+Start flash sale:
+
+```powershell
+node scripts/start-flash-sale.js $env:PRODUCT_ID
+```
+
+### Test J — 500 RPS, 30 s
+
+```powershell
+$env:TARGET_RPS="500"
+$env:DURATION_SEC="30"
+$env:STOCK="8000"
+node scripts/flash-sale-rps-test.js
+```
+
+Expected: zero 5xx errors, all admitted jobs complete, clean run.
+
+### Test K — 550 RPS, 30 s
+
+```powershell
+$env:TARGET_RPS="550"
+$env:DURATION_SEC="30"
+$env:STOCK="8000"
+node scripts/flash-sale-rps-test.js
+```
+
+Expected: 5xx responses begin to appear (infrastructure saturation), but admitted jobs still complete with no overselling.
+
+After both tests:
+
+```powershell
+node scripts/queue-status.js
+node scripts/end-flash-sale.js $env:PRODUCT_ID
+```
+
+---
+
+## Reproducing the normal-RPS experiment (Tests 1 & 2)
+
+Make sure flash sale is **inactive** first.
+
+### Test 1 — 50 RPS, 30 s
 
 ```powershell
 node scripts/setup-benchmark.js 1200
-```
-
-Set:
-
-```powershell
 $env:TEST_TOKEN="PASTE_USER_JWT"
 $env:PRODUCT_ID="PASTE_PRODUCT_ID"
 $env:TARGET_RPS="50"
 $env:DURATION_SEC="30"
 $env:STOCK="1200"
-```
-
-Run:
-
-```powershell
 node scripts/normal-rps-test.js
 ```
 
-Then repeat with the matrix values.
+### Test 2 — 100 RPS, 30 s
+
+```powershell
+node scripts/setup-benchmark.js 2600
+$env:TEST_TOKEN="PASTE_USER_JWT"
+$env:PRODUCT_ID="PASTE_PRODUCT_ID"
+$env:TARGET_RPS="100"
+$env:DURATION_SEC="30"
+$env:STOCK="2600"
+node scripts/normal-rps-test.js
+```
+
+Then repeat with the matrix values (150, 200, 250, 300 RPS) by re-running `setup-benchmark.js` with appropriate stock. Note that 150 RPS and above begins producing local environment errors on a single machine — see the bottleneck analysis for context.
 
 ---
 
