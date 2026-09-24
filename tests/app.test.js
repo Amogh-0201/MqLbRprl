@@ -1,6 +1,7 @@
 const { test, describe } = require("@jest/globals");
 const assert = require("node:assert/strict");
 const request = require("supertest");
+require("./testHelper");
 const app = require("../app");
 
 describe("Application-level routes", () => {

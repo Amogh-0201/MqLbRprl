@@ -1,7 +1,40 @@
 const mongoose = require("mongoose");
+
+jest.mock("../services/inventoryService", () => {
+    return {
+        isFlashSaleActive: jest.fn().mockResolvedValue(false),
+        reserveStock: jest.fn().mockResolvedValue({ status: 1, record: {} }),
+        completeReservation: jest.fn().mockResolvedValue(1),
+        releaseReservation: jest.fn().mockResolvedValue(1),
+        getReservation: jest.fn().mockResolvedValue(null),
+        getAvailableStock: jest.fn().mockResolvedValue(100),
+        initializeFlashSale: jest.fn().mockResolvedValue(),
+        deactivateFlashSale: jest.fn().mockResolvedValue()
+    };
+});
+
+jest.mock("../queues/orderQueue", () => {
+    return {
+        add: jest.fn().mockResolvedValue({ id: "mock-job-id" }),
+        getJob: jest.fn().mockResolvedValue(null),
+        getJobs: jest.fn().mockResolvedValue([]),
+        close: jest.fn().mockResolvedValue()
+    };
+});
+
 const app = require("../app");
 const request = require("supertest");
 const { MongoMemoryServer } = require("mongodb-memory-server");
+
+// Monkey-patch startSession to bypass transaction requirement on standalone MongoMemoryServer
+const originalStartSession = mongoose.startSession.bind(mongoose);
+mongoose.startSession = async function() {
+    const session = await originalStartSession();
+    session.withTransaction = async function(cb) {
+        return await cb();
+    };
+    return session;
+};
 
 let mongoServer;
 
